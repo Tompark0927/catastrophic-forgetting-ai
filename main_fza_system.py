@@ -145,6 +145,10 @@ class FZAManager:
         self.bridge.load_profile(silent=True)
         self.math_engine.load_from_seed(silent=True)
 
+        # ── v7.0: Warm-up Reflex Node anchors using loaded profile ──
+        if self.reflex:
+            self.reflex.warm_up(self.bridge.user_profile)
+
         # EWC 체크포인트 자동 복구
         ewc_path = os.path.join(self.vault_path, "ewc_checkpoint.pt")
         if use_local and os.path.exists(ewc_path):
@@ -183,6 +187,41 @@ class FZAManager:
                 print(f"✅ [Router] 어댑터 라우터 활성화 ({self.router.adapter_count}개 기존 어댑터).")
             except Exception as e:
                 print(f"⚠️ [Router] 비활성화: {e}")
+
+        # ── v7.0: Associative Memory Graph ──────────────────────
+        self.memory_graph = None
+        if use_local and self.router:
+            try:
+                from fza_memory_graph import FZAMemoryGraph
+                graph_vault = os.path.join(self.vault_path, "memory_graph")
+                self.memory_graph = FZAMemoryGraph(
+                    vault_path=graph_vault,
+                    similarity_threshold=0.40,
+                    max_neighbors=3,
+                )
+                self.router.memory_graph = self.memory_graph
+                print(f"🕸️  [MemoryGraph] 활성화 ({self.memory_graph.node_count}노드 / {self.memory_graph.edge_count}엣지).")
+            except Exception as e:
+                print(f"⚠️ [MemoryGraph] 비활성화: {e}")
+
+        # ── v7.0: Hebbian Fast-Weight Layer ─────────────────────
+        self.hebbian = None
+        if use_local and hasattr(self.bridge, 'raw_model'):
+            try:
+                from fza_hebbian_layer import FZAHebbianLayer
+                cfg = getattr(self.bridge.raw_model, 'config', None)
+                hidden_dim = getattr(cfg, 'hidden_size', None) or 4096
+                self.hebbian = FZAHebbianLayer.inject_into(
+                    self.bridge.raw_model,
+                    layer_index=-1,
+                    hidden_dim=hidden_dim,
+                    lr=0.01,
+                    decay=0.999,
+                )
+                hebb_path = os.path.join(self.vault_path, "hebbian_layer.pt")
+                self.hebbian.load(hebb_path)
+            except Exception as e:
+                print(f"⚠️ [Hebbian] 비활성화: {e}")
 
         # ── v4.0: Smart Replay Daemon ─────────────────────────────
         self.smart_replay = None
@@ -245,7 +284,25 @@ class FZAManager:
         # 4. Smart Replay Bank 등록 (망각 탐침 대상으로 추가)
         if self.smart_replay:
             self.smart_replay.bank.add(text_data)
-            self.smart_replay.ping()  # user is active — delay replay
+            self.smart_replay.ping()
+
+        # 5. v7.0: Hebbian Fast-Weight instant zero-backprop registration
+        if self.hebbian and hasattr(self.bridge, 'raw_model') and hasattr(self.bridge, 'tokenizer'):
+            try:
+                import torch
+                tok = self.bridge.tokenizer
+                model = self.bridge.raw_model
+                inputs = tok(text_data, return_tensors="pt", truncation=True, max_length=64).to(
+                    str(next(model.parameters()).device)
+                )
+                with torch.no_grad():
+                    out = model(**inputs, output_hidden_states=True)
+                hidden = out.hidden_states[-1].squeeze(0)   # (seq_len, hidden_dim)
+                self.hebbian.hebbian_update(query=hidden, value=hidden)
+                if self.hebbian.is_saturated:
+                    print(f"⚠️ [Hebbian] 포화도 {self.hebbian.saturation:.0%} — Sleep 후 LoRA 증류 예정.")
+            except Exception:
+                pass
 
         # LoRA: 실제 LLM 가중치에 파인튜닝 (실제 모델 연결 시)
         if self.lora:
@@ -316,6 +373,15 @@ class FZAManager:
                     print(f"🔐 [Router] 격리 어댑터 생성: {adapter_id[:8]}… ({len(memories[-10:])}개 사실)")
                 except Exception as e:
                     print(f"⚠️ [Router] 어댑터 생성 실패: {e}")
+
+        # v7.0: Persist Hebbian fast weights
+        if self.hebbian:
+            hebb_path = os.path.join(self.vault_path, "hebbian_layer.pt")
+            self.hebbian.save(hebb_path)
+
+        # v7.0: Re-warm the reflex node with the updated profile
+        if self.reflex:
+            self.reflex.warm_up(self.bridge.user_profile)
 
         print(f"🔒 [잠금] 뿌리 구역이 고정되었습니다. 망각이 차단됩니다.")
         print(f"🔑 지식 지문(Hash): {block_hash[:10]}...")
@@ -620,6 +686,16 @@ def start_fza_system(
                 manager.reflex.print_stats()
             else:
                 print("⬜ [ReflexNode] 비활성화.")
+        elif "그래프" in cmd or "graph" in cmd.lower():
+            if manager.memory_graph:
+                manager.memory_graph.print_graph_summary()
+            else:
+                print("⬜ [MemoryGraph] 비활성화.")
+        elif "헤비안" in cmd or "hebbian" in cmd.lower():
+            if manager.hebbian:
+                print(f"🧬 [Hebbian] 업데이트 {manager.hebbian.update_count}회 / 포화도 {manager.hebbian.saturation:.1%}")
+            else:
+                print("⬜ [Hebbian] 비활성화.")
         elif "EWC 상태" in cmd or "ewc" in cmd.lower():
             if manager.ewc and manager.ewc.is_active:
                 print(f"🔒 [EWC] 활성화 — {len(manager.ewc.fisher)}개 파라미터 보호 중 (λ={manager.ewc.ewc_lambda})")

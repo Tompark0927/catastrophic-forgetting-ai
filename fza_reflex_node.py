@@ -29,8 +29,23 @@ Architecture is "closed vocabulary over user facts" not "general NLU",
 so false positives are extremely rare.
 """
 import re
-from typing import Optional
+from typing import Optional, Dict, Tuple
 import numpy as np
+
+
+# ── Creative/Generative override patterns (immediate escalation) ─────────────
+# If ANY of these are matched, the reflex is SUPPRESSED even if a personal
+# keyword is also present (e.g. "write a poem about my name" must NOT be
+# intercepted — it requires deep creative reasoning from the LLM).
+_CREATIVE_OVERRIDE = [
+    r"(write|create|compose|generate|make|draft|craft|design|imagine|invent)",
+    r"(explain|analyze|analyse|evaluate|compare|contrast|describe|summarize|summarise)",
+    r"(how (do|can|should|would|could)|why (do|is|did|does|should))",
+    r"(tell me about|teach me|help me understand|help me with)",
+    r"(작성|에세이|시|소설|분석|설명|요약|비교|이유|창작|만들어|썬)",
+]
+# Pre-compiled for speed
+_CREATIVE_RE = re.compile("|".join(_CREATIVE_OVERRIDE), re.IGNORECASE)
 
 
 # ── Intent template patterns (language-agnostic, covers Korean + English) ──
@@ -111,8 +126,14 @@ class FZAReflexNode:
     Intercepts queries before they reach the LLM.
     Returns ultra-fast answers for known root facts.
 
+    v7.0 additions:
+      • Creative Override Gate   — suppresses reflex on creative/analytical queries
+      • warm_up(profile)         — pre-embeds intent anchors at startup (0 latency after)
+      • explain_decision(query)  — transparent confidence trace for debugging/research
+
     Usage:
         node = FZAReflexNode(confidence_threshold=0.72)
+        node.warm_up(user_profile)            # call once at startup
         result = node.intercept("내 이름이 뭐야?", user_profile)
         if result is not None:
             print(result)  # instant answer, LLM bypassed
@@ -133,17 +154,23 @@ class FZAReflexNode:
                                   Set False for pure keyword-mode (zero dependency, ~0ms).
             embed_model:          SentenceTransformer model name for Stage 2.
         """
-        self.threshold  = confidence_threshold
+        self.threshold    = confidence_threshold
         self.use_semantic = use_semantic
-        self._embedder  = None
+        self._embedder    = None
         self._embed_model = embed_model
 
-        # Cache: intent → list of (text, embedding) from profile facts
+        # Pre-computed intent anchor embeddings (populated by warm_up)
+        self._anchor_embs:  Optional[np.ndarray] = None
+        self._anchor_keys:  list = []
+        self._anchor_warmed = False
+
+        # Cache: intent → list of fact texts
         self._fact_cache: dict = {}
 
         # Stats
-        self.total_intercepted = 0
-        self.total_escalated   = 0
+        self.total_intercepted    = 0
+        self.total_escalated      = 0
+        self.total_creative_gates = 0    # queries that matched personal intent BUT had creative verbs
 
     @property
     def embedder(self):
@@ -156,8 +183,52 @@ class FZAReflexNode:
         return self._embedder
 
     def _embed(self, texts: list) -> np.ndarray:
-        embs = self.embedder.encode(texts, normalize_embeddings=True)
-        return embs
+        return self.embedder.encode(texts, normalize_embeddings=True)
+
+    # ── Startup warm-up (pre-compute anchor embeddings once) ──────
+    def warm_up(self, user_profile: dict = None):
+        """
+        Pre-embeds all intent anchors so Stage 2 cosine lookups are
+        instantaneous during the session (no cold-start embedding lag).
+        Also caches fact values from user_profile for semantic matching.
+
+        Call once at system startup. Takes ~200ms, saves time on every query.
+        """
+        if not self.use_semantic or not self.embedder:
+            return
+        anchors = {
+            "name":     "What is my name? 나의 이름이 뛰야?",
+            "age":      "How old am I? 내 나이가 몇 살이야?",
+            "location": "Where do I live? 나는 어디 살아?",
+            "job":      "What is my job? 내 직업이 뛰야?",
+            "hobby":    "What are my hobbies? 내 취미는?",
+            "goal":     "What are my goals? 내 목표는?",
+            "family":   "Tell me about my family. 내 가족은?",
+        }
+        self._anchor_keys = list(anchors.keys())
+        self._anchor_embs = self._embed(list(anchors.values()))
+        # Pre-cache user fact values
+        if user_profile:
+            for intent, hints in _CATEGORY_KEYS.items():
+                facts = [
+                    v for k, v in user_profile.items()
+                    if not k.startswith("_") and any(h.lower() in k.lower() for h in hints)
+                ]
+                if facts:
+                    self._fact_cache[intent] = facts
+        self._anchor_warmed = True
+        print(f"⚡ [ReflexNode] Warm-up 완료 — {len(anchors)}개 앙커 임베딩, "
+              f"{sum(len(v) for v in self._fact_cache.values())}개 변수 캐시됨.")
+
+    # ── Creative Override Gate (즌 0ms) ─────────────────────────
+    def _is_creative(self, query: str) -> bool:
+        """
+        Returns True if the query contains creative/analytical verbs that
+        signal the user wants GENERATION, not RETRIEVAL.
+        Example: "Write a poem using my name" → True (escalate, even though
+                 it also matches the 'name' intent).
+        """
+        return bool(_CREATIVE_RE.search(query))
 
     # ── Stage 1: Lexical Reflex (~0ms) ────────────────────────────
     def _lexical_intent(self, query: str) -> Optional[str]:
@@ -168,37 +239,46 @@ class FZAReflexNode:
                     return intent
         return None
 
-    # ── Stage 2: Semantic Reflex (~50ms) ──────────────────────────
+    # ── Stage 2: Semantic Reflex (~50ms or 0ms if warmed) ──────
     def _semantic_intent(self, query: str) -> Optional[str]:
         if not self.use_semantic or not self.embedder:
             return None
         q_emb = self._embed([query])[0]
-        # Intent anchors: representative question per category
-        anchors = {
-            "name":     "What is my name? 내 이름이 뭐야?",
-            "age":      "How old am I? 내 나이가 몇 살이야?",
-            "location": "Where do I live? 나는 어디 살아?",
-            "job":      "What is my job? 내 직업이 뭐야?",
-            "hobby":    "What are my hobbies? 내 취미는?",
-            "goal":     "What are my goals? 내 목표는?",
-            "family":   "Tell me about my family. 내 가족은?",
-        }
-        anchor_texts = list(anchors.values())
-        anchor_keys  = list(anchors.keys())
-        anchor_embs  = self._embed(anchor_texts)
-        scores = anchor_embs @ q_emb
-        best_idx = int(np.argmax(scores))
-        best_score = float(scores[best_idx])
-        if best_score >= self.threshold:
-            return anchor_keys[best_idx]
-        # Also check if query closely matches a known memory text
+
+        # Use pre-warmed anchors if available (0 embedding overhead)
+        if self._anchor_warmed and self._anchor_embs is not None:
+            scores    = self._anchor_embs @ q_emb
+            best_idx  = int(np.argmax(scores))
+            best_score = float(scores[best_idx])
+            if best_score >= self.threshold:
+                return self._anchor_keys[best_idx]
+        else:
+            anchors = {
+                "name":     "What is my name? 내 이름이 뛰야?",
+                "age":      "How old am I? 내 나이가 몇 살이야?",
+                "location": "Where do I live? 나는 어디 살아?",
+                "job":      "What is my job? 내 직업이 뛰야?",
+                "hobby":    "What are my hobbies? 내 취미는?",
+                "goal":     "What are my goals? 내 목표는?",
+                "family":   "Tell me about my family. 내 가족은?",
+            }
+            anchor_texts = list(anchors.values())
+            anchor_keys  = list(anchors.keys())
+            anchor_embs  = self._embed(anchor_texts)
+            scores    = anchor_embs @ q_emb
+            best_idx  = int(np.argmax(scores))
+            best_score = float(scores[best_idx])
+            if best_score >= self.threshold:
+                return anchor_keys[best_idx]
+
+        # Fallback: check against cached fact values
         if self._fact_cache:
             all_texts = [t for texts in self._fact_cache.values() for t in texts]
             if all_texts:
-                f_embs = self._embed(all_texts)
+                f_embs   = self._embed(all_texts)
                 f_scores = f_embs @ q_emb
-                best_f = float(np.max(f_scores))
-                if best_f >= self.threshold + 0.05:  # tighter for memory match
+                best_f   = float(np.max(f_scores))
+                if best_f >= self.threshold + 0.05:
                     return "_memory"
         return None
 
@@ -255,8 +335,9 @@ class FZAReflexNode:
             None — Intent unknown or low confidence (ESCALATE to LLM).
 
         Energy:
-            Stage 1 (lexical): ~0ms CPU
-            Stage 2 (semantic): ~50ms CPU, no GPU
+            Stage 0 (creative gate):  ~0ms, regex only
+            Stage 1 (lexical):        ~0ms CPU
+            Stage 2 (semantic):       ~0ms if warmed, ~50ms CPU cold
         """
         if not user_profile or not query.strip():
             return None
@@ -266,7 +347,15 @@ class FZAReflexNode:
         if not structured and not memories:
             return None
 
-        # ── Stage 1: Lexical ──────────────────────────────────────
+        # ── Stage 0: Creative Override Gate ──────────────────────
+        # If the query wants GENERATION, skip reflex entirely.
+        # "Write a poem about my name" should go to Mistral, not be intercepted.
+        if self._is_creative(query):
+            self.total_creative_gates += 1
+            self.total_escalated += 1
+            return None
+
+        # ── Stage 1: Lexical ─────────────────────────────────
         intent = self._lexical_intent(query)
 
         # ── Stage 2: Semantic (only if Stage 1 missed) ────────────
@@ -277,13 +366,12 @@ class FZAReflexNode:
             self.total_escalated += 1
             return None
 
-        # ── Stage 3: Extract & Format ─────────────────────────────
+        # ── Stage 3: Extract & Format ──────────────────────────
         if intent == "_memory":
             response = self._format_response(intent, [], memories)
         else:
             facts = self._extract_facts(intent, user_profile)
             if not facts:
-                # Known intent but no matching data → escalate
                 self.total_escalated += 1
                 return None
             response = self._format_response(intent, facts)
@@ -293,9 +381,54 @@ class FZAReflexNode:
             return None
 
         self.total_intercepted += 1
-        print(f"⚡ [ReflexNode] 인터셉트 성공 — Mistral 우아하게 취침 중 💤  "
-              f"({self.total_intercepted}번 인터셉트 / {self.total_escalated}번 에스컬레이션)")
+        print(f"⚡ [ReflexNode] 인터셉트 성공 — Mistral 우아하게 취침 중 퓨  "
+              f"({self.total_intercepted}번 인터셉트 / {self.total_escalated}번 에스쾌레이션)")
         return response
+
+    # ── Explainability ──────────────────────────────────
+    def explain_decision(self, query: str, user_profile: dict) -> Dict:
+        """
+        Returns a detailed trace of WHY the reflex fired or didn't.
+        Designed for research logging and user-facing transparency.
+
+        Returns dict with keys:
+            decision:       'INTERCEPT' | 'ESCALATE'
+            stage_fired:    0 (creative) | 1 (lexical) | 2 (semantic) | None
+            intent:         detected intent or None
+            confidence:     float confidence score if semantic stage used
+            reason:         human-readable explanation
+        """
+        if not user_profile or not query.strip():
+            return {"decision": "ESCALATE", "stage_fired": None, "intent": None, "confidence": 0.0, "reason": "Empty query or profile."}
+
+        # Stage 0
+        if self._is_creative(query):
+            return {"decision": "ESCALATE", "stage_fired": 0, "intent": None,
+                    "confidence": 0.0, "reason": "크리에이티브 패턴 감지 — 딥 리젌닝이 필요합니다."}
+        # Stage 1
+        intent_1 = self._lexical_intent(query)
+        if intent_1:
+            facts = self._extract_facts(intent_1, user_profile)
+            if facts:
+                return {"decision": "INTERCEPT", "stage_fired": 1, "intent": intent_1,
+                        "confidence": 1.0, "reason": f"레시컈 패턴 매칭: '{intent_1}'—사실 {len(facts)}개 발견."}
+        # Stage 2
+        if self.use_semantic and self.embedder:
+            q_emb = self._embed([query])[0]
+            if self._anchor_warmed and self._anchor_embs is not None:
+                scores    = self._anchor_embs @ q_emb
+                best_idx  = int(np.argmax(scores))
+                score     = float(scores[best_idx])
+                intent_2  = self._anchor_keys[best_idx] if score >= self.threshold else None
+            else:
+                intent_2, score = None, 0.0
+            if intent_2:
+                return {"decision": "INTERCEPT", "stage_fired": 2, "intent": intent_2,
+                        "confidence": score, "reason": f"임베딩 유사도 {score:.2f} ≥ {self.threshold} 임벗값 — '{intent_2}'."}
+            else:
+                return {"decision": "ESCALATE", "stage_fired": 2, "intent": None,
+                        "confidence": score, "reason": f"임베딩 유사도 {score:.2f} < 임벗값 {self.threshold} — LLM 에스쾌레이션."}
+        return {"decision": "ESCALATE", "stage_fired": None, "intent": None, "confidence": 0.0, "reason": "시맨틱 레이어 비활성화."}
 
     # ── Stats helpers ─────────────────────────────────────────────
     @property
