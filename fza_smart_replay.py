@@ -183,15 +183,70 @@ class FZASmartReplay:
         except Exception:
             return 0.0
 
+    # ── v8.0: Sleep Spindles (Hyper-Distillation) ──────────────────
+    @torch.no_grad()
+    def _generate_sleep_spindles(self, fact: str) -> List[str]:
+        """
+        Forces the model to generate semantic variations of the memory.
+        This ensures the LoRA generalizes perfectly and prevents overfitting 
+        to the exact syntax of the original input.
+        """
+        # We use a highly restrictive prompt to force pure semantic variation
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        prompt = (
+            f"<s>[INST] Rewrite the following fact into 3 different conversational variations. "
+            f"Do not add new information. Output ONLY the variations, one per line.\n"
+            f"Fact: {fact}\n[/INST]"
+        )
+        
+        inputs = self.tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(self.device)
+        self.model.eval()
+        
+        try:
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=100,
+                temperature=0.8,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+            raw_out = self.tokenizer.decode(output_ids[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
+            
+            # Parse lines and clean them up
+            variations = []
+            for line in raw_out.split('\n'):
+                cleaned = line.strip('-* 1234567890.')
+                if len(cleaned) > 5 and len(cleaned) < 150:
+                    variations.append(cleaned)
+                    
+            # Return the original fact + at most 3 variations
+            spindles = [fact] + variations[:3]
+            return spindles
+        except Exception as e:
+            print(f"⚠️ [SmartReplay] 수면 방추 생성 실패: {e}")
+            return [fact]
+
     # ── Micro-replay: train on high-risk facts ─────────────────────
     def _micro_replay(self, facts: List[str]):
         """
         Minimal gradient update on high-risk facts.
-        Uses AdamW with a tiny LR — not LoRA, just direct param update on
-        the top leaf layers. Budget-capped at self.max_replay_steps.
+        v8.0: Uses Sleep Spindles to train on an augmented synthetic dataset.
+        Budget-capped at self.max_replay_steps.
         """
         if not facts:
             return
+
+        # Generate sleep spindles BEFORE setting the model to Train mode
+        # This expands the training set from e.g. 1 string to 4 semantic strings
+        spindles = []
+        for fact in facts:
+            variants = self._generate_sleep_spindles(fact)
+            spindles.extend(variants)
+
+        # Shuffle the augmented dataset
+        random.shuffle(spindles)
 
         self.model.train()
         if self._optimizer is None:
@@ -200,25 +255,27 @@ class FZASmartReplay:
             )
 
         total_steps = 0
-        for fact in facts:
+        for data_point in spindles:
             if total_steps >= self.max_replay_steps:
                 break
             inputs = self.tokenizer(
-                fact,
+                data_point,
                 return_tensors="pt",
                 truncation=True,
                 max_length=128,
             ).to(self.device)
+            
             self._optimizer.zero_grad()
             outputs = self.model(**inputs, labels=inputs["input_ids"])
             outputs.loss.backward()
+            
             # Gradient clipping — prevents runaway updates
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
             self._optimizer.step()
             total_steps += 1
 
         self.model.eval()
-        print(f"🌙 [SmartReplay] 마이크로 리플레이 완료: {total_steps}스텝 / {len(facts)}개 사실")
+        print(f"🌙 [SmartReplay] 수면 방추 리플레이 완료: {total_steps}스텝 / {len(facts)}개 원본 (-> {len(spindles)}개 변형)")
 
     # ── Main loop ──────────────────────────────────────────────────
     def _loop(self):
