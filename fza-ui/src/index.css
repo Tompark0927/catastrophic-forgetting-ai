@@ -93,10 +93,13 @@ body::before {
 
 .chat-panel {
   flex: 1;
+  min-height: 0;
+  /* Critical for nested flex scrolling */
 }
 
 .sensorium-panel {
   width: 380px;
+  min-height: 0;
 }
 
 /* Panel Headers */
