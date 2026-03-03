@@ -160,6 +160,44 @@ class FZAManager:
             except Exception as e:
                 print(f"⚠️ [EWC] 복구 실패: {e}")
 
+        # ── v4.0: Adapter Router ──────────────────────────────────
+        self.router = None
+        if use_local and hasattr(self.bridge, 'raw_model'):
+            try:
+                from fza_adapter_router import FZAAdapterRouter
+                router_vault = os.path.join(self.vault_path, "adapters")
+                self.router = FZAAdapterRouter(
+                    base_model=self.bridge.raw_model,
+                    tokenizer=self.bridge.tokenizer,
+                    vault_path=router_vault,
+                )
+                print(f"✅ [Router] 어댑터 라우터 활성화 ({self.router.adapter_count}개 기존 어댑터).")
+            except Exception as e:
+                print(f"⚠️ [Router] 비활성화: {e}")
+
+        # ── v4.0: Smart Replay Daemon ─────────────────────────────
+        self.smart_replay = None
+        if use_local and hasattr(self.bridge, 'raw_model'):
+            try:
+                from fza_smart_replay import FZASmartReplay, ReplayMemoryBank
+                rb = ReplayMemoryBank(
+                    path=os.path.join(self.vault_path, "replay_bank.json")
+                )
+                device = str(next(self.bridge.raw_model.parameters()).device)
+                self.smart_replay = FZASmartReplay(
+                    model=self.bridge.raw_model,
+                    tokenizer=self.bridge.tokenizer,
+                    replay_bank=rb,
+                    loss_tolerance=1.30,
+                    idle_threshold_s=120.0,
+                    max_replay_steps=5,
+                    probe_interval_s=300.0,
+                    device=device,
+                )
+                self.smart_replay.start()
+            except Exception as e:
+                print(f"⚠️ [SmartReplay] 비활성화: {e}")
+
     # ── 학습 / 사실 등록 ────────────────────────────────────────
     def learn_info(self, text_data):
         """유저의 정보를 루트 프로필에 저장합니다.
@@ -194,6 +232,11 @@ class FZAManager:
         if self.rag:
             self.rag.add(text_data)
             self.rag.save(path=os.path.join(self.vault_path, "rag_memory"))
+
+        # 4. Smart Replay Bank 등록 (망각 탐침 대상으로 추가)
+        if self.smart_replay:
+            self.smart_replay.bank.add(text_data)
+            self.smart_replay.ping()  # user is active — delay replay
 
         # LoRA: 실제 LLM 가중치에 파인튜닝 (실제 모델 연결 시)
         if self.lora:
@@ -254,6 +297,16 @@ class FZAManager:
                 print("🔒 [EWC] Fisher 보호 활성화 완료 — Root 구역이 수학적으로 보호됩니다.")
             except Exception as e:
                 print(f"⚠️ [EWC] Fisher 캡쳐 실패 — {e}")
+
+        # ── v4.0: Create an isolated frozen adapter for these memories ──
+        if self.router:
+            memories = self.bridge.user_profile.get('_memories', [])
+            if memories:
+                try:
+                    adapter_id = self.router.create_and_freeze_adapter(memories[-10:])
+                    print(f"🔐 [Router] 격리 어댑터 생성: {adapter_id[:8]}… ({len(memories[-10:])}개 사실)")
+                except Exception as e:
+                    print(f"⚠️ [Router] 어댑터 생성 실패: {e}")
 
         print(f"🔒 [잠금] 뿌리 구역이 고정되었습니다. 망각이 차단됩니다.")
         print(f"🔑 지식 지문(Hash): {block_hash[:10]}...")
@@ -368,6 +421,8 @@ class FZAManager:
 
     # ── AI 대화 ─────────────────────────────────────────────────
     def chat(self, message: str) -> str:
+        if self.smart_replay:
+            self.smart_replay.ping()   # user is active — delay replay
         return self.bridge.chat(message)
 
     def chat_and_remember(self, message: str, conv_id: str = None) -> dict:
