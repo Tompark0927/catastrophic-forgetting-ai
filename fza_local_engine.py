@@ -89,6 +89,37 @@ class FZALocalEngine:
         self.model.eval()
         print(f"✅ [LocalEngine] '{model_name}' ready on {self.device.upper()}.")
 
+        # ── Phase 4: v10.0 Neuromorphic Modules ─────────────────────────────
+        # 1. Native Hebbian Fast-Weights in attention blocks
+        try:
+            from fza_attention_patch import FZAAttentionPatcher
+            self.attention_patcher = FZAAttentionPatcher(self.model, patch_layers=[0, 1, 2])
+            n_patched = self.attention_patcher.apply()
+            print(f"🧬 [LocalEngine] {n_patched}개 어텍션 블록에 Hebbian Fast-Weight 주입 완료")
+        except Exception as e:
+            self.attention_patcher = None
+            print(f"⚠️ [LocalEngine] AttentionPatch 실패 (무시): {e}")
+
+        # 2. Infinite Context Manager (rolling compression)
+        try:
+            from fza_infinite_context import InfiniteContextManager
+            self.infinite_ctx = InfiniteContextManager(
+                tokenizer=self.tokenizer, manager=None, max_tokens=3200
+            )
+            print(f"♾️ [LocalEngine] Infinite Context Manager 초기화 (유효: {self.infinite_ctx.max_tokens}토큰)")
+        except Exception as e:
+            self.infinite_ctx = None
+            print(f"⚠️ [LocalEngine] InfiniteCtx 실패 (무시): {e}")
+
+        # 3. MetaCognition Engine (self-modification)
+        try:
+            from fza_meta_cognition import MetaCognitionEngine
+            self.meta_cognition = MetaCognitionEngine(manager=None)
+            print(f"🧠 [LocalEngine] MetaCognition Engine 초기화 완료")
+        except Exception as e:
+            self.meta_cognition = None
+            print(f"⚠️ [LocalEngine] MetaCog 실패 (무시): {e}")
+
     # ── Internal: build the system + user context prompt ──────────
     def _build_chat_prompt(self, user_message: str) -> str:
         """
@@ -172,7 +203,18 @@ class FZALocalEngine:
             # Emit raw token for real-time WebSocket streaming
             bus.emit("token", {"text": token})
             print(token, end="", flush=True)
-            
+
+        thread.join()
+
+        # ── Phase 4: MetaCognition post-processing ────────────────────────
+        if getattr(self, 'meta_cognition', None):
+            clean_output, directives = self.meta_cognition.process(generated_text)
+            if directives:
+                from fza_event_bus import bus as _bus
+                _bus.emit("meta_cognition", {"directives": directives})
+            return clean_output
+
+        return generated_text
         print() # Newline after generation completes
 
         return generated_text.strip()
