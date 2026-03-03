@@ -1054,6 +1054,35 @@ def start_fza_system(
             _swarm_status()
         elif "유휴 종료" in cmd:
             _swarm_cull()
+        # ── Phase 11 (v17.0): Latent Telepathy Commands ─────────────────────
+        elif "텔레파시 시작" in cmd:
+            # '텔레파시 시작 9200' — start a TelepathyNode listener on the given port
+            raw = cmd.split()
+            port = int(raw[-1]) if raw[-1].isdigit() else 9200
+            from fza_latent_telepathy import TelepathyNode
+            _tp_node = TelepathyNode(host="0.0.0.0", port=port)
+            _tp_node.start_listener(
+                on_receive=lambda t, addr: print(f"\n🧠← [텔레파시] {addr}로부터 수신: {t.shape}")
+            )
+            print(f"📡 [텔레파시] 리스너 시작 @ port {port}")
+        elif "텔레파시 전송" in cmd:
+            # '텔레파시 전송 [port]' — send a random test vector to loopback
+            raw = cmd.split()
+            port = int(raw[-1]) if raw[-1].isdigit() else 9200
+            import torch
+            from fza_latent_telepathy import TelepathyNode
+            _tp_send = TelepathyNode(host="0.0.0.0", port=9299)
+            vec = torch.randn(8, 256)
+            _tp_send.send_thought(vec, peer_host="127.0.0.1", peer_port=port)
+        elif "텔레파시 상태" in cmd:
+            print("📡 [텔레파시] 모듈 로드 확인 중...")
+            from fza_latent_telepathy import TelepathyNode
+            from fza_vector_compression import compress_payload, compression_ratio
+            import torch
+            test = torch.randn(4, 256)
+            enc = compress_payload(test)
+            ratio = compression_ratio(test, enc)
+            print(f"   fp16 압축률: {ratio:.1f}x | 패킷 크기: {len(enc)}B | 준비 완료 ✅")
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()
