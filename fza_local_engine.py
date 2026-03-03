@@ -170,7 +170,38 @@ class FZALocalEngine:
 
         self.conversation_history.append({"role": "user", "content": user_message})
         prompt = self._build_chat_prompt(user_message)
-        reply  = self._generate(prompt)
+        
+        # v8.0: PageRank LoRA Interpolation Routing
+        # If the manager attached a router to us, use it.
+        router = getattr(self, "router", None)
+        if router:
+            # 1. Expand graph to get neighbors and PageRank scores
+            if hasattr(router, "memory_graph") and router.memory_graph:
+                # Find direct cosine matches first to use as seeds
+                seeds = router.route(user_message, top_k=2)
+                if seeds:
+                    neighbors = router.memory_graph.expand_neighbors(seeds, top_k=3)
+                    adapter_ids = [n[0] for n in neighbors]
+                    adapter_weights = [n[1] for n in neighbors]
+                else:
+                    adapter_ids = []
+                    adapter_weights = []
+            else:
+                # Fallback to simple cosine routing if graph is disabled
+                adapter_ids = router.route(user_message, top_k=3)
+                adapter_weights = [1.0 / len(adapter_ids)] * len(adapter_ids) if adapter_ids else []
+
+            reply = router.generate_with_adapters(
+                prompt=prompt,
+                adapter_ids=adapter_ids,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                adapter_weights=adapter_weights,
+            )
+        else:
+            # Plain base model generation
+            reply = self._generate(prompt)
+            
         self.conversation_history.append({"role": "assistant", "content": reply})
         return reply
 

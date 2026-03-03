@@ -203,6 +203,8 @@ class FZAManager:
                     vault_path=router_vault,
                 )
                 print(f"✅ [Router] 어댑터 라우터 활성화 ({self.router.adapter_count}개 기존 어댑터).")
+                # v8.0: Attach router to bridge for dynamic PageRank generation
+                self.bridge.router = self.router
             except Exception as e:
                 print(f"⚠️ [Router] 비활성화: {e}")
 

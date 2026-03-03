@@ -248,35 +248,82 @@ class FZAAdapterRouter:
         adapter_ids: List[str],
         max_new_tokens: int = 512,
         temperature: float = 0.7,
+        adapter_weights: List[float] = None,
     ) -> str:
         """
-        Loads the selected LoRA adapters, merges them into the base model
-        (weighted sum), runs inference, then unloads — leaving base model clean.
-
-        Energy: one forward pass with merged delta weights.
+        Loads the selected LoRA adapters and merges them dynamically.
+        v8.0: Uses graph PageRank scores (adapter_weights) to interpolate
+        multiple adapters simultaneously via peft's multi-adapter feature.
         """
         from peft import PeftModel
 
         if not adapter_ids:
-            # No relevant adapters — fall back to plain base model
             return self._generate_base(prompt, max_new_tokens, temperature)
 
-        # Merge adapters sequentially with equal weighting
-        # (for 1-3 adapters this is negligible compute)
-        merged = self.base_model
-        weight = 1.0 / len(adapter_ids)
-
+        # Equal weight if PageRank interpolation isn't provided
+        if not adapter_weights:
+            adapter_weights = [1.0 / len(adapter_ids)] * len(adapter_ids)
+        
+        # Load all adapters into the PEFT cache without permanently modifying base weights
+        peft_m = None
+        loaded_names = []
         for aid in adapter_ids:
             meta = self.bank.get_meta(aid)
             if not meta or not os.path.exists(meta["path"]):
                 continue
-            try:
-                peft_m = PeftModel.from_pretrained(merged, meta["path"])
-                merged = peft_m.merge_and_unload()   # bakes LoRA into weights
-            except Exception as e:
-                print(f"⚠️ [Router] 어댑터 {aid[:8]} 로드 실패: {e}")
+            
+            # For the first adapter, wrap the model
+            if peft_m is None:
+                try:
+                    peft_m = PeftModel.from_pretrained(self.base_model, meta["path"], adapter_name=aid)
+                except Exception as e:
+                    print(f"⚠️ [Router] 기본 어댑터 {aid[:8]} 로드 실패: {e}")
+                    continue
+            else:
+                # For subsequent adapters, just load them into the existing PeftModel
+                try:
+                    peft_m.load_adapter(meta["path"], adapter_name=aid)
+                except Exception as e:
+                    print(f"⚠️ [Router] 추가 어댑터 {aid[:8]} 로드 실패: {e}")
+                    continue
+            loaded_names.append(aid)
 
-        result = self._generate_base(prompt, max_new_tokens, temperature, model=merged)
+        if not loaded_names:
+            return self._generate_base(prompt, max_new_tokens, temperature)
+
+        # Dynamically mix the adapters using PageRank weights (Morphological Computation)
+        if len(loaded_names) == 1:
+            peft_m.set_adapter(loaded_names[0])
+            print(f"🧬 [Router] 단일 어댑터 활성화: {loaded_names[0][:8]}")
+        else:
+            final_name = "pagerank_mix"
+            # Extract weights corresponding to successfully loaded adapters
+            valid_w = [adapter_weights[adapter_ids.index(name)] for name in loaded_names]
+            # Normalize weights so they sum to 1.0
+            s = sum(valid_w)
+            norm_w = [w / s for w in valid_w] if s > 0 else valid_w
+            
+            try:
+                # peft method to create a new virtual adapter from a weighted sum
+                peft_m.add_weighted_adapter(
+                    adapters=loaded_names,
+                    weights=norm_w,
+                    adapter_name=final_name,
+                    combination_type="linear"
+                )
+                peft_m.set_adapter(final_name)
+                print(f"🧬 [Router] 그래프 보간: {len(loaded_names)}개 어댑터를 PageRank 가중치로 동적 병합 (가중치: {[round(w,2) for w in norm_w]})")
+            except Exception as e:
+                print(f"⚠️ [Router] 어댑터 병합 실패 (개별 로드Fallback): {e}")
+                peft_m.set_adapter(loaded_names[0])
+
+        # Run inference through the dynamically morphed network
+        result = self._generate_base(prompt, max_new_tokens, temperature, model=peft_m)
+        
+        # Clean up: detach the peft wrappers so the base model is pristine for the next query
+        if hasattr(peft_m, "unload"):
+            self.base_model = peft_m.unload()
+            
         return result
 
     def _generate_base(
