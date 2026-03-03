@@ -245,6 +245,13 @@ class FZASmartReplay:
             variants = self._generate_sleep_spindles(fact)
             spindles.extend(variants)
 
+        # Notify UI that sleep spindles have completed memory augmentation
+        try:
+            from fza_event_bus import bus
+            bus.emit("sleep_spindles", {"original_facts": facts, "expanded_count": len(spindles)})
+        except ImportError:
+            pass
+
         # Shuffle the augmented dataset
         random.shuffle(spindles)
 

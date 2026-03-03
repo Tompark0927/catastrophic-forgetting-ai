@@ -295,6 +295,8 @@ class FZAAdapterRouter:
         if len(loaded_names) == 1:
             peft_m.set_adapter(loaded_names[0])
             print(f"🧬 [Router] 단일 어댑터 활성화: {loaded_names[0][:8]}")
+            from fza_event_bus import bus
+            bus.emit("pagerank_morph", {"nodes": loaded_names, "weights": [1.0]})
         else:
             final_name = "pagerank_mix"
             # Extract weights corresponding to successfully loaded adapters
@@ -312,7 +314,10 @@ class FZAAdapterRouter:
                     combination_type="linear"
                 )
                 peft_m.set_adapter(final_name)
-                print(f"🧬 [Router] 그래프 보간: {len(loaded_names)}개 어댑터를 PageRank 가중치로 동적 병합 (가중치: {[round(w,2) for w in norm_w]})")
+                str_w = [round(w,2) for w in norm_w]
+                print(f"🧬 [Router] 그래프 보간: {len(loaded_names)}개 어댑터를 PageRank 가중치로 동적 병합 (가중치: {str_w})")
+                from fza_event_bus import bus
+                bus.emit("pagerank_morph", {"nodes": loaded_names, "weights": str_w})
             except Exception as e:
                 print(f"⚠️ [Router] 어댑터 병합 실패 (개별 로드Fallback): {e}")
                 peft_m.set_adapter(loaded_names[0])

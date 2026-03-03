@@ -523,6 +523,11 @@ class FZAManager:
         if self.reflex:
             instant = self.reflex.intercept(message, self.bridge.user_profile)
             if instant is not None:
+                try:
+                    from fza_event_bus import bus
+                    bus.emit("reflex_intercept", {"type": "v6.0_jellyfish", "query": message})
+                except ImportError:
+                    pass
                 return instant   # LLM bypassed completely ⚡
 
         # ── v8.0: Micro Reflex intercept (Dynamic Sparsity) ───────
@@ -530,6 +535,11 @@ class FZAManager:
             micro_action = self.micro_reflex.intercept(message)
             if micro_action is not None:
                 print(f"🧠 [MicroReflex] 구조적 쿼리 감지 ('{micro_action['intent']}'). 동적 스파시티 가동 (RAG/그래프 생략).")
+                try:
+                    from fza_event_bus import bus
+                    bus.emit("micro_reflex", {"intent": micro_action['intent']})
+                except ImportError:
+                    pass
                 # Route directly to raw model with zero-context system prompt
                 return self.bridge._generate(
                     system_prompt=micro_action["system_prompt"],

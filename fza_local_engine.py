@@ -138,6 +138,10 @@ class FZALocalEngine:
 
     # ── Internal: run inference ────────────────────────────────────
     def _generate(self, prompt: str) -> str:
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+        from fza_event_bus import bus
+        
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
@@ -145,20 +149,33 @@ class FZALocalEngine:
             max_length=3072,
         ).to(self.device)
 
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                do_sample=True,
-                top_p=0.9,
-                repetition_penalty=1.1,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        
+        generation_kwargs = dict(
+            **inputs,
+            streamer=streamer,
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+            do_sample=True,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
 
-        # Strip the prompt tokens from the output
-        new_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
-        return self.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+        # Run generation in a background thread so we can yield tokens
+        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+
+        generated_text = ""
+        for token in streamer:
+            generated_text += token
+            # Emit raw token for real-time WebSocket streaming
+            bus.emit("token", {"text": token})
+            print(token, end="", flush=True)
+            
+        print() # Newline after generation completes
+
+        return generated_text.strip()
 
     # ── Public: chat (mirrors FZALLMBridge.chat) ──────────────────
     def chat(self, user_message: str) -> str:
