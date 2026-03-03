@@ -141,6 +141,24 @@ class FZAManager:
         os.makedirs(self.conversations_path, exist_ok=True)
         self.current_conv_id = None
 
+        # ── v6.0: Reflex Node (Jellyfish Edge Router) ──
+        try:
+            from fza_reflex_node import FZAReflexNode
+            self.reflex = FZAReflexNode(confidence_threshold=0.72, use_semantic=True)
+            print("⚡ [ReflexNode] 젤리피시 엣지 라우터 활성화. GPU 절약 모드 ON.")
+        except Exception as e:
+            print(f"⚠️ [ReflexNode] 비활성화: {e}")
+            self.reflex = None
+
+        # ── v8.0: Micro Reflex Node (Dynamic Sparsity Router) ───
+        try:
+            from fza_micro_reflex import FZAMicroReflex
+            self.micro_reflex = FZAMicroReflex(confidence_threshold=0.65)
+            print("🧠 [MicroReflex] 마이크로 구조적 라우터 활성화. 컨텍스트 바이패스 대기 중.")
+        except Exception as e:
+            print(f"⚠️ [MicroReflex] 비활성화: {e}")
+            self.micro_reflex = None
+
         # 시작 시 자동 복구 (silent — 파일 없어도 에러 없음)
         self.bridge.load_profile(silent=True)
         self.math_engine.load_from_seed(silent=True)
@@ -505,6 +523,17 @@ class FZAManager:
             if instant is not None:
                 return instant   # LLM bypassed completely ⚡
 
+        # ── v8.0: Micro Reflex intercept (Dynamic Sparsity) ───────
+        if getattr(self, "micro_reflex", None):
+            micro_action = self.micro_reflex.intercept(message)
+            if micro_action is not None:
+                print(f"🧠 [MicroReflex] 구조적 쿼리 감지 ('{micro_action['intent']}'). 동적 스파시티 가동 (RAG/그래프 생략).")
+                # Route directly to raw model with zero-context system prompt
+                return self.bridge._generate(
+                    system_prompt=micro_action["system_prompt"],
+                    user_message=message
+                )
+
         return self.bridge.chat(message)
 
     def chat_and_remember(self, message: str, conv_id: str = None) -> dict:
@@ -686,6 +715,8 @@ def start_fza_system(
                 manager.reflex.print_stats()
             else:
                 print("⬜ [ReflexNode] 비활성화.")
+            if getattr(manager, "micro_reflex", None):
+                manager.micro_reflex.print_stats()
         elif "그래프" in cmd or "graph" in cmd.lower():
             if manager.memory_graph:
                 manager.memory_graph.print_graph_summary()
