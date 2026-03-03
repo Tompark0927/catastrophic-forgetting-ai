@@ -817,6 +817,47 @@ def start_fza_system(
         else:
             print("   (아직 공간 정보가 없습니다. '봐봐, [위치]에 [물건]이 있어'로 알려줘!)")
 
+    # ── Phase 8 (v14.0): Singularity Threshold Helpers ──────────────────────
+    def _get_self_architect():
+        """Returns SelfArchitect from engine (if available) or standalone."""
+        if hasattr(manager, 'bridge') and hasattr(manager.bridge, 'self_architect') and manager.bridge.self_architect:
+            return manager.bridge.self_architect
+        from fza_self_architect import SelfArchitect
+        return SelfArchitect(model=None)
+
+    def _sa_reflect():
+        """'자가 진단' — full architectural self-assessment."""
+        sa = _get_self_architect()
+        sa.reflect()
+
+    def _sa_spawn(domain):
+        """'로브 생성 [도메인]' — manually spawn a new domain lobe."""
+        if not domain:
+            print("❓ 형식: 로브 생성 [도메인]  예) 로브 생성 quantum_physics")
+            return
+        sa = _get_self_architect()
+        lobe_id = sa.spawn_lobe(domain)
+        sa.spawner.activate(lobe_id, target_gate=0.1)
+        print(f"🧠 [SelfArchitect] '{domain}' 로브 생성 및 웜-업 시작: {lobe_id[:8]}")
+
+    def _sa_lobes():
+        """'로브 목록' — list all domain lobes."""
+        sa = _get_self_architect()
+        lobes = sa.spawner.list_lobes()
+        if not lobes:
+            print("🧠 [LobeSpawner] 생성된 로브 없음 — '로브 생성 [도메인]'으로 시작하세요")
+            return
+        print(f"\n🧠 [LobeSpawner] {len(lobes)}개 로브:")
+        for l in lobes:
+            print(f"   • {l['domain']:<25} {l['status']:<10} gate={l['gate_value']:.2f} "
+                  f"활성화={l['activation_count']}회 [{l['lobe_id'][:8]}]")
+
+    def _sa_kernels():
+        """'커널 보고서' — show KernelForge bottleneck report."""
+        sa = _get_self_architect()
+        sa.forge.print_report()
+
+
 
     while True:
 
@@ -917,6 +958,16 @@ def start_fza_system(
             _spatial_locate(cmd)
         elif "공간 지도" in cmd or "세계 지도" in cmd:
             _spatial_map()
+        # ── Phase 8 (v14.0): Singularity Threshold Commands ─────────────────
+        elif "자가 진단" in cmd or "self reflect" in cmd.lower():
+            _sa_reflect()
+        elif "로브 생성" in cmd:
+            domain = cmd[cmd.index("로브 생성") + 5:].strip()
+            _sa_spawn(domain)
+        elif "로브 목록" in cmd:
+            _sa_lobes()
+        elif "커널 보고서" in cmd:
+            _sa_kernels()
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()

@@ -130,6 +130,20 @@ class FZALocalEngine:
             self.visual_memory = None
             print(f"⚠️ [LocalEngine] VisualMemory 실패 (무시): {e}")
 
+        # 5. Self-Architect — Singularity Threshold (v14.0)
+        try:
+            from fza_self_architect import SelfArchitect
+            self.self_architect = SelfArchitect(
+                model=self.model,
+                device=self.device,
+                lobes_dir="./lobes",
+            )
+            print(f"🏛️  [LocalEngine] SelfArchitect 초기화 완료")
+        except Exception as e:
+            self.self_architect = None
+            print(f"⚠️ [LocalEngine] SelfArchitect 실패 (무시): {e}")
+
+
     # ── Internal: build the system + user context prompt ──────────
     def _build_chat_prompt(self, user_message: str) -> str:
         """
