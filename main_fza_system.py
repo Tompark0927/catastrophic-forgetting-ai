@@ -160,6 +160,15 @@ class FZAManager:
             except Exception as e:
                 print(f"⚠️ [EWC] 복구 실패: {e}")
 
+        # ── v6.0: Biomimetic Reflex Node (Jellyfish Edge Router) ──
+        try:
+            from fza_reflex_node import FZAReflexNode
+            self.reflex = FZAReflexNode(confidence_threshold=0.72, use_semantic=True)
+            print("⚡ [ReflexNode] 젤리피시 엣지 라우터 활성화. GPU 절약 모드 ON.")
+        except Exception as e:
+            print(f"⚠️ [ReflexNode] 비활성화: {e}")
+            self.reflex = None
+
         # ── v4.0: Adapter Router ──────────────────────────────────
         self.router = None
         if use_local and hasattr(self.bridge, 'raw_model'):
@@ -423,6 +432,13 @@ class FZAManager:
     def chat(self, message: str) -> str:
         if self.smart_replay:
             self.smart_replay.ping()   # user is active — delay replay
+
+        # ── v6.0: Reflex Node intercept (Jellyfish) ───────────────
+        if self.reflex:
+            instant = self.reflex.intercept(message, self.bridge.user_profile)
+            if instant is not None:
+                return instant   # LLM bypassed completely ⚡
+
         return self.bridge.chat(message)
 
     def chat_and_remember(self, message: str, conv_id: str = None) -> dict:
@@ -533,6 +549,7 @@ def start_fza_system(
     print("='모델 압축'              -> 뿌리 가중치 프루닝+양자화")
     print("='블록 융합 [이름A] [이름B]' -> 두 블록 가중 평균 융합")
     print("='EWC 상태'              -> EWC 보호 파라미터 수 확인")
+    print("='반사 통계'              -> Jellyfish 리플렉스 노드 바이패스 통계")
     print("="*55)
 
     while True:
@@ -598,6 +615,11 @@ def start_fza_system(
             manager.load_block("permanent_knowledge")
         elif "다 지워" in cmd:
             manager.flush_memory()
+        elif "반사 통계" in cmd or "reflex" in cmd.lower():
+            if manager.reflex:
+                manager.reflex.print_stats()
+            else:
+                print("⬜ [ReflexNode] 비활성화.")
         elif "EWC 상태" in cmd or "ewc" in cmd.lower():
             if manager.ewc and manager.ewc.is_active:
                 print(f"🔒 [EWC] 활성화 — {len(manager.ewc.fisher)}개 파라미터 보호 중 (λ={manager.ewc.ewc_lambda})")
