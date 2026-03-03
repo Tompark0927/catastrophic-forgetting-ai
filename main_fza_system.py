@@ -857,6 +857,43 @@ def start_fza_system(
         sa = _get_self_architect()
         sa.forge.print_report()
 
+    # ── Phase 9 (v15.0): OS Symbiosis Helpers ───────────────────────────────
+    def _get_os_agent():
+        """Returns OSAgent from engine (if available) or a dry_run standalone."""
+        if hasattr(manager, 'bridge') and getattr(manager.bridge, 'os_agent', None):
+            return manager.bridge.os_agent
+        from fza_procedural_memory import ProceduralMemory
+        from fza_os_agent import OSAgent
+        pm = ProceduralMemory()
+        return OSAgent(procedural_memory=pm, dry_run=True)
+
+    def _os_observe():
+        """'화면 관찰' — take a screenshot and describe the current screen."""
+        agent = _get_os_agent()
+        desc = agent.observe()
+        print(f"\n👁️  [OSAgent] 화면 설명:\n{desc}")
+
+    def _os_execute(goal):
+        """'실행 [목표]' — execute an OS task."""
+        if not goal:
+            print("❓ 형식: 실행 [목표]  예) 실행 Safari 열기")
+            return
+        agent = _get_os_agent()
+        result = agent.execute_task(goal)
+        print(f"\n{'✅' if result['success'] else '❌'} [OSAgent] '{goal}' | "
+              f"단계: {result['steps_executed']} | 화면 변화: {result.get('screen_changed', '-')}")
+
+    def _os_procedures():
+        """'프로시저 목록' — list all learned OS workflows."""
+        from fza_procedural_memory import ProceduralMemory
+        pm = _get_os_agent().procedural_memory or ProceduralMemory()
+        pm.print_summary()
+
+    def _os_enable_control():
+        """'컴퓨터 제어 활성화' — switch OSAgent from dry_run to live mode."""
+        agent = _get_os_agent()
+        agent.executor.dry_run = False
+        print("⚠️  [OSAgent] 🔴 실제 컴퓨터 제어 활성화됨 — 'PyAutoGUI FAILSAFE: 마우스 좌상단 이동시 중단'")
 
 
     while True:
@@ -968,6 +1005,15 @@ def start_fza_system(
             _sa_lobes()
         elif "커널 보고서" in cmd:
             _sa_kernels()
+        # ── Phase 9 (v15.0): OS Symbiosis Commands ──────────────────────────
+        elif "화면 관찰" in cmd or "스크린샷" in cmd:
+            _os_observe()
+        elif cmd.startswith("실행 "):
+            _os_execute(cmd[3:].strip())
+        elif "프로시저 목록" in cmd:
+            _os_procedures()
+        elif "컴퓨터 제어 활성화" in cmd:
+            _os_enable_control()
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()

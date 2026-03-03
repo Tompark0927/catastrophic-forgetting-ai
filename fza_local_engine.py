@@ -143,6 +143,25 @@ class FZALocalEngine:
             self.self_architect = None
             print(f"⚠️ [LocalEngine] SelfArchitect 실패 (무시): {e}")
 
+        # 6. OS Agent — Operating System Symbiosis (v15.0)
+        try:
+            from fza_procedural_memory import ProceduralMemory
+            from fza_os_agent import OSAgent
+            self.procedural_memory = ProceduralMemory()
+            _llm_fn = getattr(self, '_generate_text', None)
+            self.os_agent = OSAgent(
+                procedural_memory=self.procedural_memory,
+                dry_run=True,   # Default to dry_run — user must explicitly enable real actions
+                llm_fn=_llm_fn,
+            )
+            proc_stats = self.procedural_memory.get_stats()
+            print(f"🖥️  [LocalEngine] OSAgent 초기화 완료 | 프로시저: {proc_stats['total_procedures']}개")
+        except Exception as e:
+            self.procedural_memory = None
+            self.os_agent = None
+            print(f"⚠️ [LocalEngine] OSAgent 실패 (무시): {e}")
+
+
 
     # ── Internal: build the system + user context prompt ──────────
     def _build_chat_prompt(self, user_message: str) -> str:
