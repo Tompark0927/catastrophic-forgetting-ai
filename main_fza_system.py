@@ -895,6 +895,38 @@ def start_fza_system(
         agent.executor.dry_run = False
         print("⚠️  [OSAgent] 🔴 실제 컴퓨터 제어 활성화됨 — 'PyAutoGUI FAILSAFE: 마우스 좌상단 이동시 중단'")
 
+    # ── Phase 10 (v16.0): Swarm Replication Helpers ─────────────────────────
+    _swarm = None
+    def _get_swarm():
+        nonlocal _swarm
+        if _swarm is None:
+            from fza_swarm_provisioner import SwarmProvisioner
+            _swarm = SwarmProvisioner(backend="mock")
+        return _swarm
+
+    def _swarm_spawn(label):
+        """'세포분열 [이유]' — spawn a new child node."""
+        label = label or "generic overflow node"
+        sp = _get_swarm()
+        node_id = sp.spawn_child(label)
+        if node_id:
+            import time; time.sleep(0.6)   # Wait for background thread
+            print(f"\n🦠 [Swarm] 분열 완료: [{node_id[:8]}] '{label}'")
+        else:
+            print("⚠️  [Swarm] 최대 노드 수 도달 또는 분열 실패")
+
+    def _swarm_status():
+        """'떼 상태' — show all active swarm nodes."""
+        _get_swarm().print_swarm_status()
+
+    def _swarm_cull():
+        """'유휴 종료' — cull idle nodes."""
+        sp = _get_swarm()
+        culled = sp.cull_idle_nodes(max_idle_seconds=60)
+        if culled:
+            print(f"🗑️  [Swarm] {len(culled)}개 유휴 노드 종료됨")
+        else:
+            print("🦠 [Swarm] 종료할 유휴 노드 없음")
 
     while True:
 
@@ -1014,6 +1046,14 @@ def start_fza_system(
             _os_procedures()
         elif "컴퓨터 제어 활성화" in cmd:
             _os_enable_control()
+        # ── Phase 10 (v16.0): Swarm Replication Commands ────────────────────
+        elif "세포분열" in cmd:
+            label = cmd[cmd.index("세포분열") + 4:].strip()
+            _swarm_spawn(label or "overflow node")
+        elif "떼 상태" in cmd or "swarm" in cmd.lower():
+            _swarm_status()
+        elif "유휴 종료" in cmd:
+            _swarm_cull()
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()
