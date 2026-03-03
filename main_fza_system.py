@@ -1083,6 +1083,25 @@ def start_fza_system(
             enc = compress_payload(test)
             ratio = compression_ratio(test, enc)
             print(f"   fp16 압축률: {ratio:.1f}x | 패킷 크기: {len(enc)}B | 준비 완료 ✅")
+        # ── Phase 12 (v18.0): Physical Embodiment Commands ──────────────────
+        elif "로봇 실행" in cmd:
+            intent = cmd[cmd.index("로봇 실행") + 5:].strip()
+            if not intent:
+                print("❓ 형식: 로봇 실행 [동작]  예) 로봇 실행 책상으로 이동해")
+            else:
+                from fza_motor_cortex import MotorCortex
+                from fza_ros2_bridge import FZAROS2Bridge
+                _bridge = FZAROS2Bridge(robot_name="fza_bot", dry_run=True)
+                _mc = MotorCortex(world_graph=None, ros2_bridge=_bridge)
+                result = _mc.execute_intent(intent)
+                print(f"{'✅' if result['success'] else '❌'} [로봇] '{result['skill_name']}' | {result['commands_executed']}개 명령")
+        elif "운동 기억" in cmd:
+            from fza_motor_cortex import MotorAdapterBank
+            MotorAdapterBank().print_summary()
+        elif "로봇 상태" in cmd:
+            from fza_ros2_bridge import FZAROS2Bridge, _ROS2_AVAILABLE
+            bridge_stat = FZAROS2Bridge(robot_name="fza_bot", dry_run=True)
+            bridge_stat.print_status()
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()
