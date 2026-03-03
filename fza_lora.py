@@ -23,7 +23,7 @@ import torch
 
 
 class FZALoRA:
-    def __init__(self, model, tokenizer, target_modules=None, r=16, lora_alpha=32):
+    def __init__(self, model, tokenizer, target_modules=None, r=16, lora_alpha=32, ewc=None):
         """
         Args:
             model:          HuggingFace CausalLM 모델
@@ -32,6 +32,9 @@ class FZALoRA:
                             None 이면 ["q_proj", "v_proj"] 사용 (LLaMA/Mistral 기본값)
             r:              LoRA rank (높을수록 표현력↑, 메모리↑)
             lora_alpha:     LoRA 스케일링 계수 (보통 r*2)
+            ewc:            Optional FZAEwc instance. When supplied, the EWC
+                            penalty is added to the training loss to protect
+                            Root-zone parameters from catastrophic forgetting.
         """
         from peft import LoraConfig, get_peft_model, TaskType
 
@@ -46,18 +49,21 @@ class FZALoRA:
         self.model     = get_peft_model(model, config)
         self.tokenizer = tokenizer
         self.device    = next(model.parameters()).device
+        self.ewc       = ewc  # FZAEwc instance or None
         self.optimizer = torch.optim.AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=2e-4,
         )
 
         trainable, total = self.model.get_nb_trainable_parameters()
-        print(f"🔧 [LoRA] 준비 완료. 학습 파라미터: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+        ewc_status = f" | EWC: {'✅ 활성화' if ewc and ewc.is_active else '⬜ 비활성화'}" 
+        print(f"🔧 [LoRA] 준비 완료. 학습 파라미터: {trainable:,} / {total:,} ({100*trainable/total:.2f}%){ewc_status}")
 
     # ── 사실 파인튜닝 ─────────────────────────────────────────
     def train_on_fact(self, fact_text: str, steps: int = 20):
         """
         단일 사실 텍스트를 LLM 가중치에 직접 새깁니다.
+        EWC 인스턴스가 있으면 Root 구역 보호 패널티를 손실에 추가합니다.
 
         Args:
             fact_text: 학습시킬 문장 ("홍길동은 뛰어난 개발자입니다.")
@@ -76,16 +82,32 @@ class FZALoRA:
             max_length=128,
         ).to(self.device)
 
-        last_loss = 0.0
+        last_loss      = 0.0
+        last_task_loss = 0.0
+        last_ewc_loss  = 0.0
         for _ in range(steps):
             self.optimizer.zero_grad()
-            outputs = self.model(**inputs, labels=inputs["input_ids"])
-            outputs.loss.backward()
+            outputs   = self.model(**inputs, labels=inputs["input_ids"])
+            task_loss = outputs.loss
+
+            # ── EWC Penalty (Root 보호) ───────────────────────
+            ewc_penalty = torch.tensor(0.0, device=self.device)
+            if self.ewc and self.ewc.is_active:
+                ewc_penalty = self.ewc.ewc_loss().to(self.device)
+
+            total_loss = task_loss + ewc_penalty
+            total_loss.backward()
             self.optimizer.step()
-            last_loss = outputs.loss.item()
+
+            last_loss      = total_loss.item()
+            last_task_loss = task_loss.item()
+            last_ewc_loss  = ewc_penalty.item()
 
         print(f"🔥 [LoRA 학습] '{fact_text[:40]}' — {steps}스텝 완료.")
-        print(f"   최종 loss: {last_loss:.4f}  ✅ 가중치에 실제로 새겨졌습니다.")
+        if self.ewc and self.ewc.is_active:
+            print(f"   task_loss: {last_task_loss:.4f}  |  EWC 패널티: {last_ewc_loss:.4f}  |  total: {last_loss:.4f}")
+        else:
+            print(f"   최종 loss: {last_loss:.4f}  ✅ 가중치에 실제로 새겨졌습니다.")
 
     # ── 어댑터 저장 / 불러오기 ────────────────────────────────
     def save_adapter(self, path="vault/lora_adapter"):

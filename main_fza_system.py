@@ -61,19 +61,31 @@ class FZANetwork(nn.Module):
 
 # ── 통합 관리 시스템 ──────────────────────────────────────────
 class FZAManager:
-    def __init__(self, user_id="default", model=None, tokenizer=None, config=None):
+    def __init__(
+        self,
+        user_id="default",
+        model=None,
+        tokenizer=None,
+        config=None,
+        use_local: bool = False,
+        local_model_name: str = "mistralai/Mistral-7B-Instruct-v0.3",
+    ):
         """
         Args:
-            user_id:   사용자 식별자. 멀티유저 지원 (vault/users/{user_id}/).
-            model:     실제 LLM(HuggingFace nn.Module) 또는 None (→ 데모 FZANetwork).
-            tokenizer: HuggingFace 토크나이저. model 과 함께 주면 LoRA 활성화.
-            config:    FZAConfig 인스턴스. None 이면 장난감 모델 기본값.
+            user_id:          사용자 식별자. 멀티유저 지원 (vault/users/{user_id}/).
+            model:            실제 LLM(HuggingFace nn.Module) 또는 None (→ 데모 FZANetwork).
+            tokenizer:        HuggingFace 토크나이저.
+            config:           FZAConfig 인스턴스.
+            use_local:        True 이면 FZALocalEngine(로컬 Mistral/Llama).
+                              False 이면 FZALLMBridge(Anthropic API) 사용.
+            local_model_name: use_local=True 일 때 로드할 HuggingFace 모델 ID.
         """
         self.user_id    = user_id
         self.vault_path = os.path.join("vault", "users", user_id)
         os.makedirs(self.vault_path, exist_ok=True)
 
         self.config = config or FZAConfig()
+        self.use_local = use_local
 
         if model is not None:
             self.model = model
@@ -96,18 +108,33 @@ class FZAManager:
             print("⚠️ [RAG] 비활성화 (pip install sentence-transformers faiss-cpu)")
             self.rag = None
 
+        # ── EWC placeholder ─────────────────────────────────
+        self.ewc = None
+
+        # ── Local Engine OR Anthropic Bridge ─────────────────
+        if use_local:
+            from fza_local_engine import FZALocalEngine
+            self.bridge = FZALocalEngine(
+                model_name=local_model_name,
+                math_engine=self.math_engine,
+                memory=self.rag,
+                vault_path=self.vault_path,
+            )
+            print(f"✅ [LocalEngine] '{local_model_name}' 연결.")
+        else:
+            self.bridge = FZALLMBridge(
+                self.math_engine, memory=self.rag, vault_path=self.vault_path
+            )
+
         # ── LoRA 초기화 (실제 모델 + 토크나이저가 있을 때만) ──
         self.lora = None
         if model is not None and tokenizer is not None:
             try:
                 from fza_lora import FZALoRA
-                self.lora = FZALoRA(self.model, tokenizer)
+                self.lora = FZALoRA(self.model, tokenizer, ewc=self.ewc)
                 print("✅ [LoRA] 가중치 파인튜닝 엔진 활성화.")
             except Exception as e:
                 print(f"⚠️ [LoRA] 비활성화 ({e})")
-
-        # ── LLM Bridge (RAG + vault_path 연결) ───────────────
-        self.bridge = FZALLMBridge(self.math_engine, memory=self.rag, vault_path=self.vault_path)
 
         # 대화 저장 경로
         self.conversations_path = os.path.join(self.vault_path, "conversations")
@@ -117,6 +144,21 @@ class FZAManager:
         # 시작 시 자동 복구 (silent — 파일 없어도 에러 없음)
         self.bridge.load_profile(silent=True)
         self.math_engine.load_from_seed(silent=True)
+
+        # EWC 체크포인트 자동 복구
+        ewc_path = os.path.join(self.vault_path, "ewc_checkpoint.pt")
+        if use_local and os.path.exists(ewc_path):
+            try:
+                from fza_ewc import FZAEwc
+                self.ewc = FZAEwc(
+                    self.bridge.raw_model,
+                    zone_patterns=self.config.root_patterns,
+                )
+                self.ewc.load(ewc_path)
+                if self.lora:
+                    self.lora.ewc = self.ewc
+            except Exception as e:
+                print(f"⚠️ [EWC] 복구 실패: {e}")
 
     # ── 학습 / 사실 등록 ────────────────────────────────────────
     def learn_info(self, text_data):
@@ -162,14 +204,23 @@ class FZAManager:
 
     # ── 지식 잠금 & 블록 추출 ────────────────────────────────────
     def lock_and_export(self, block_name="permanent_knowledge"):
-        """지정 구역을 동결하고 물리적 파일(Block)로 추출합니다."""
-        FZAStorage.lock_zone(self.model, self.config.root_patterns)
-        if hasattr(self.model, 'is_locked'):
-            self.model.is_locked = True
+        """지정 구역을 동결하고 물리적 파일(Block)로 추출합니다.
+        use_local=True 시 EWC Fisher Information Matrix도 자동 캡쳐."""
+
+        # Which model to lock: local engine raw model or toy FZANetwork
+        target_model = (
+            self.bridge.raw_model
+            if (self.use_local and hasattr(self.bridge, 'raw_model'))
+            else self.model
+        )
+
+        FZAStorage.lock_zone(target_model, self.config.root_patterns)
+        if hasattr(target_model, 'is_locked'):
+            target_model.is_locked = True
 
         block_path = os.path.join(self.vault_path, block_name)
         path, block_hash = FZAStorage.export_root_block(
-            self.model,
+            target_model,
             block_name=block_path,
             zone_patterns=self.config.root_patterns,
         )
@@ -179,6 +230,30 @@ class FZAManager:
             self.math_engine.compress_to_seed()
         if self.rag:
             self.rag.save(path=os.path.join(self.vault_path, "rag_memory"))
+
+        # ── EWC: Compute Fisher Information Matrix over permanent memories ──
+        if self.use_local and hasattr(self.bridge, 'raw_model'):
+            try:
+                from fza_ewc import FZAEwc
+                memories = self.bridge.user_profile.get('_memories', [])
+                device   = str(next(target_model.parameters()).device)
+                self.ewc = FZAEwc(
+                    target_model,
+                    zone_patterns=self.config.root_patterns,
+                    ewc_lambda=1000.0,
+                )
+                self.ewc.compute_fisher(
+                    tokenizer=self.bridge.tokenizer,
+                    memory_texts=memories,
+                    device=device,
+                )
+                ewc_ckpt = os.path.join(self.vault_path, "ewc_checkpoint.pt")
+                self.ewc.save(ewc_ckpt)
+                if self.lora:
+                    self.lora.ewc = self.ewc
+                print("🔒 [EWC] Fisher 보호 활성화 완료 — Root 구역이 수학적으로 보호됩니다.")
+            except Exception as e:
+                print(f"⚠️ [EWC] Fisher 캡쳐 실패 — {e}")
 
         print(f"🔒 [잠금] 뿌리 구역이 고정되었습니다. 망각이 차단됩니다.")
         print(f"🔑 지식 지문(Hash): {block_hash[:10]}...")
@@ -377,28 +452,33 @@ class FZAManager:
 
 
 # ── CLI 인터페이스 ────────────────────────────────────────────
-def start_fza_system():
-    manager = FZAManager()
-    print("\n" + "="*45)
-    print("🌿 세상에 없던 망각 없는 AI: FZA System v2.0")
-    print("='내 이름은 000이야' -> 학습 시뮬레이션")
-    print("='평생 기억해' -> 지식 잠금 및 파일 추출")
-    print("='불러와' -> 저장된 지식 블록 복구")
-    print("='다 지워' -> 일시 정보 삭제 (용량 확보)")
-    print("='상태 보고서' -> 지식 지형도 출력")
+def start_fza_system(
+    use_local: bool = False,
+    local_model_name: str = "mistralai/Mistral-7B-Instruct-v0.3",
+):
+    manager = FZAManager(use_local=use_local, local_model_name=local_model_name)
+    engine_label = f"🔥 LocalEngine ({local_model_name})" if use_local else "☁️  Claude API (Anthropic)"
+    print("\n" + "="*55)
+    print(f"🌿 FZA System v3.0 — 세상에 없던 망각 없는 AI")
+    print(f"   추론 엔진: {engine_label}")
+    print("="*55)
+    print("='내 이름은 000이야'      -> 사실 학습 (루트 저장)")
+    print("='평생 기억해'            -> 지식 잠금 + EWC Fisher 캡쳐")
+    print("='불러와'                 -> 저장된 지식 블록 복구")
+    print("='다 지워'                -> 일시 정보 삭제 (Leaf 초기화)")
+    print("='상태 보고서'            -> 지식 지형도 출력")
+    print("--- [AI 대화] ---")
+    print("='물어봐 [질문]'          -> AI에게 질문 (루트+RAG 자동 주입)")
+    print("='기억해 [텍스트]'        -> RAG 벡터 기억에 직접 추가")
+    print("='기억 검색 [쿼리]'       -> 의미 유사 기억 검색")
     print("--- [수학 엔진] ---")
     print("='수식 추가 [이름] [수식]' -> 수식 등록")
-    print("='수식 압축' -> 수식 씨앗 파일 저장")
-    print("='수식 불러와' -> 씨앗 파일에서 수식 복구")
-    print("='수식 목록' -> 등록된 수식 확인")
-    print("--- [AI 대화] ---")
-    print("='물어봐 [질문]' -> Claude에게 질문 (루트+수식+RAG 자동 주입)")
-    print("='기억해 [텍스트]' -> RAG 벡터 기억에 직접 추가")
-    print("='기억 검색 [쿼리]' -> 의미 유사 기억 검색 (테스트용)")
+    print("='수식 목록'              -> 등록된 수식 확인")
     print("--- [고급 도구] ---")
-    print("='모델 압축' -> 뿌리 가중치 프루닝+양자화")
+    print("='모델 압축'              -> 뿌리 가중치 프루닝+양자화")
     print("='블록 융합 [이름A] [이름B]' -> 두 블록 가중 평균 융합")
-    print("="*45)
+    print("='EWC 상태'              -> EWC 보호 파라미터 수 확인")
+    print("="*55)
 
     while True:
         cmd = input("\n[명령]: ").strip()
@@ -463,6 +543,11 @@ def start_fza_system():
             manager.load_block("permanent_knowledge")
         elif "다 지워" in cmd:
             manager.flush_memory()
+        elif "EWC 상태" in cmd or "ewc" in cmd.lower():
+            if manager.ewc and manager.ewc.is_active:
+                print(f"🔒 [EWC] 활성화 — {len(manager.ewc.fisher)}개 파라미터 보호 중 (λ={manager.ewc.ewc_lambda})")
+            else:
+                print("⬜ [EWC] 비활성화 — '평생 기억해' 후 자동 활성화됩니다.")
         elif "상태 보고서" in cmd or "지형도" in cmd:
             manager.report_status()
         elif "종료" in cmd:
@@ -473,4 +558,10 @@ def start_fza_system():
 
 
 if __name__ == "__main__":
-    start_fza_system()
+    import sys
+    use_local_flag = "--local" in sys.argv
+    model_arg = next(
+        (sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--model" and i + 1 < len(sys.argv)),
+        "mistralai/Mistral-7B-Instruct-v0.3",
+    )
+    start_fza_system(use_local=use_local_flag, local_model_name=model_arg)
