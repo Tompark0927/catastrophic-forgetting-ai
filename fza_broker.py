@@ -32,10 +32,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import uvicorn
 
+from fza_node_registry import NodeRegistry
+
 # In-memory store: adapter_id → {blob, metadata, timestamp}
 _adapter_store: Dict[str, Any] = {}
 _ws_connections: Dict[str, WebSocket] = {}
 _main_loop = None
+_node_registry = NodeRegistry()   # v11.0 — live Hive-Mind node catalog
 
 
 def _broadcast_sync(event: dict):
@@ -157,11 +160,73 @@ async def delete_adapter(adapter_id: str):
 
 @app.get("/status")
 async def status():
+    alive = _node_registry.get_alive()
     return {
         "status": "online",
         "adapters": len(_adapter_store),
-        "nodes": len(_ws_connections),
+        "ws_connections": len(_ws_connections),
+        "hive_nodes": len(alive),
     }
+
+
+# ── v11.0: Node Registry Endpoints ──────────────────────────────────────────
+@app.post("/nodes/register")
+async def register_node(payload: dict):
+    """
+    A FZA node calls this endpoint when it boots to announce itself.
+    Payload: { host, port, adapter_count, adapter_topics, device, node_id (optional) }
+    """
+    node = _node_registry.register(
+        host=payload.get("host", "localhost"),
+        port=payload.get("port", 8000),
+        adapter_count=payload.get("adapter_count", 0),
+        adapter_topics=payload.get("adapter_topics", []),
+        device=payload.get("device", "cpu"),
+        node_id=payload.get("node_id"),
+    )
+    await _broadcast_async({"type": "node_registered", "node_id": node.node_id, "host": node.host})
+    return {"status": "registered", "node_id": node.node_id}
+
+
+@app.post("/nodes/heartbeat")
+async def node_heartbeat(payload: dict):
+    """FZA nodes call this every 30s to stay marked as alive."""
+    node_id = payload.get("node_id")
+    if not node_id:
+        raise HTTPException(status_code=400, detail="node_id required")
+    ok = _node_registry.heartbeat(
+        node_id=node_id,
+        adapter_count=payload.get("adapter_count"),
+        load=payload.get("load"),
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Node not registered")
+    return {"status": "ok"}
+
+
+@app.get("/nodes/list")
+async def list_nodes():
+    """Returns all currently alive FZA nodes and their metadata."""
+    return _node_registry.summary()
+
+
+@app.post("/nodes/find_experts")
+async def find_experts(payload: dict):
+    """
+    Given a list of query topics, returns the top-K most relevant expert nodes.
+    Payload: { topics: [str], top_k: int }
+    """
+    topics = payload.get("topics", [])
+    top_k = payload.get("top_k", 2)
+    experts = _node_registry.find_experts(topics, top_k=top_k)
+    return {"experts": [e.to_dict() for e in experts], "queried_topics": topics}
+
+
+@app.delete("/nodes/{node_id}")
+async def unregister_node(node_id: str):
+    """Manually removes a node from the registry."""
+    _node_registry.unregister(node_id)
+    return {"status": "unregistered"}
 
 
 if __name__ == "__main__":

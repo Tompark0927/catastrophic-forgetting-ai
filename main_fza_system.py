@@ -733,6 +733,53 @@ def start_fza_system(
         bus.emit("ewc_merge_complete", {"alpha": alpha, "params_merged": len(merged)})
         print(f"🌿 [Mesh] EWC 병합 완료 — α={alpha}, {len(merged)}개 파라미터 통합, 루트 보호 완료")
 
+    # ── Phase 5 (v11.0): Hive-Mind Helpers ─────────────────────────────────────
+    HIVE_BROKER = "http://localhost:8001"
+
+    def _hive_status():
+        import requests
+        try:
+            resp = requests.get(f"{HIVE_BROKER}/nodes/list", timeout=5)
+            if not resp.ok:
+                print(f"⚠️ [Hive] 브로커 연결 실패")
+                return
+            data = resp.json()
+            nodes = data.get("nodes", [])
+            print(f"\n🍄 [Hive-Mind] 라이브 노드: {len(nodes)}개 / 전체: {data.get('total_registered', 0)}개")
+            for n in nodes:
+                print(f"   • {n['node_id'][:8]} | {n['host']}:{n['port']} | {n['device'].upper()} | 어댑터 {n['adapter_count']}개 | 주제: {n['adapter_topics'][:3]}")
+        except Exception as e:
+            print(f"⚠️ [Hive] 상태 조회 실패: {e}")
+
+    def _hive_single(query):
+        from fza_distributed_inference import DistributedInferenceEngine
+        die = DistributedInferenceEngine(broker_url=HIVE_BROKER)
+        result = die.query_single_expert(query)
+        if result and result.succeeded:
+            print(f"\n🌐 [Hive-Single] 노드 {result.node_id[:8]} 응답 ({result.latency_ms:.0f}ms):\n{result.reply}")
+        else:
+            err = result.error if result else "없음"
+            print(f"⚠️ [Hive-Single] 실패 또는 노드 없음: {err}")
+
+    def _hive_ensemble(query):
+        from fza_distributed_inference import DistributedInferenceEngine
+        die = DistributedInferenceEngine(broker_url=HIVE_BROKER)
+        result = die.query_ensemble(query, top_k=2)
+        if result.get("merged_reply"):
+            print(f"\n🌐 [Hive-앙상블] 비로드 노드 {result.get('best_node','?')[:8]} 응답:\n{result['merged_reply']}")
+        else:
+            print(f"⚠️ [Hive-앙상블] 반환할 노드가 없습니다.")
+
+    def _hive_chain(query):
+        from fza_distributed_inference import DistributedInferenceEngine
+        die = DistributedInferenceEngine(broker_url=HIVE_BROKER)
+        result = die.chain_of_thought_split(query)
+        if result.get("reply"):
+            print(f"\n🧠 [체인-오브-소트] 사고 프레임:\n{result.get('thinking_frame','')[:200]}")
+            print(f"\n💬 최종 응답:\n{result['reply']}")
+        else:
+            print(f"⚠️ [체인-오브-소트] 노드가  2개 이상 필요합니다.")
+
     while True:
 
         cmd = input("\n[명령]: ").strip()
@@ -808,6 +855,21 @@ def start_fza_system(
                 try: _a = float(_p); break
                 except ValueError: pass
             _mesh_ewc_merge(alpha=max(0.01, min(0.9, _a)))
+        # ── Phase 5 (v11.0): Hive-Mind Commands ─────────────────────────────
+        elif "하이브 상태" in cmd or "hive" in cmd.lower():
+            _hive_status()
+        elif "분산 추론" in cmd:
+            q = cmd[cmd.index("분산 추론") + 5:].strip()
+            if q: _hive_single(q)
+            else: print("❓ 형식: 분산 추론 [질문]")
+        elif "앙상블 추론" in cmd:
+            q = cmd[cmd.index("앙상블 추론") + 6:].strip()
+            if q: _hive_ensemble(q)
+            else: print("❓ 형식: 앙상블 추론 [질문]")
+        elif "체인 추론" in cmd:
+            q = cmd[cmd.index("체인 추론") + 5:].strip()
+            if q: _hive_chain(q)
+            else: print("❓ 형식: 체인 추론 [질문]")
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()
