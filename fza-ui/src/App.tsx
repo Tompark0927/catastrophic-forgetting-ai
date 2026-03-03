@@ -28,7 +28,7 @@ function App() {
 
   useEffect(() => {
     const connect = () => {
-      const socket = new WebSocket('ws://localhost:8000/ws')
+      const socket = new WebSocket('ws://localhost:8000/ws/chat')
       ws.current = socket
 
       socket.onopen = () => setConnected(true)
