@@ -780,6 +780,44 @@ def start_fza_system(
         else:
             print(f"⚠️ [체인-오브-소트] 노드가  2개 이상 필요합니다.")
 
+    # ── Phase 7 (v13.0): Spatial Grounding Helpers ──────────────────────────
+    def _get_visual_memory():
+        """Returns the VisualMemoryPipeline — from engine if local, else standalone."""
+        if hasattr(manager, 'bridge') and hasattr(manager.bridge, 'visual_memory') and manager.bridge.visual_memory:
+            return manager.bridge.visual_memory
+        # Fallback: standalone instance
+        from fza_visual_memory import VisualMemoryPipeline
+        return VisualMemoryPipeline()
+
+    def _spatial_observe(text):
+        """'봐봐' — ingest a scene description into spatial memory."""
+        vm = _get_visual_memory()
+        result = vm.ingest_description(text)
+        if result["objects_detected"]:
+            print(f"\n🏠 [공간 기억] 저장 완료:")
+            for obj in result["objects_detected"]:
+                print(f"   • {obj} → {result['location'].replace('_', ' ')}")
+        else:
+            print("⚠️ [공간 기억] 객체를 인식하지 못했습니다. 더 구체적으로 말해줘 (예: '책상 위에 노트북이 있어')")
+
+    def _spatial_locate(query):
+        """'어디 있어' — answer a "where is X?" query from spatial memory."""
+        vm = _get_visual_memory()
+        answer = vm.answer_location_query(query)
+        print(f"\n📍 [공간 기억] {answer}")
+
+    def _spatial_map():
+        """'공간 지도' — show the full world graph."""
+        vm = _get_visual_memory()
+        summary = vm.world_graph.build_natural_language_summary()
+        stats = vm.get_stats()
+        print(f"\n🗺️  [세계 지도] 총 {stats['world_graph_objects']}개 객체, {stats['spatial_adapters']}개 공간 어댑터")
+        if summary:
+            print(summary)
+        else:
+            print("   (아직 공간 정보가 없습니다. '봐봐, [위치]에 [물건]이 있어'로 알려줘!)")
+
+
     while True:
 
         cmd = input("\n[명령]: ").strip()
@@ -870,6 +908,15 @@ def start_fza_system(
             q = cmd[cmd.index("체인 추론") + 5:].strip()
             if q: _hive_chain(q)
             else: print("❓ 형식: 체인 추론 [질문]")
+        # ── Phase 7 (v13.0): Spatial Grounding Commands ─────────────────────
+        elif "봐봐" in cmd:
+            scene = cmd[cmd.index("봐봐") + 3:].strip()
+            if scene: _spatial_observe(scene)
+            else: print("❓ 형식: 봐봐, [위치]에 [물건]이 있어  예) 봐봐, 책상 위에 노트북이 있어")
+        elif "어디 있어" in cmd or "어디에 있어" in cmd:
+            _spatial_locate(cmd)
+        elif "공간 지도" in cmd or "세계 지도" in cmd:
+            _spatial_map()
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()

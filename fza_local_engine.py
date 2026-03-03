@@ -120,6 +120,16 @@ class FZALocalEngine:
             self.meta_cognition = None
             print(f"⚠️ [LocalEngine] MetaCog 실패 (무시): {e}")
 
+        # 4. Visual Memory Pipeline (spatial grounding)
+        try:
+            from fza_visual_memory import VisualMemoryPipeline
+            self.visual_memory = VisualMemoryPipeline()
+            stats = self.visual_memory.get_stats()
+            print(f"🗃️ [LocalEngine] VisualMemory 초기화 완료 — 세계 객체: {stats['world_graph_objects']}개, 공간 어댑터: {stats['spatial_adapters']}개")
+        except Exception as e:
+            self.visual_memory = None
+            print(f"⚠️ [LocalEngine] VisualMemory 실패 (무시): {e}")
+
     # ── Internal: build the system + user context prompt ──────────
     def _build_chat_prompt(self, user_message: str) -> str:
         """
@@ -155,6 +165,13 @@ class FZALocalEngine:
             context_parts.append("\n[수식 — 100% 정확도 보장]")
             for name, formula in self.math_engine.math_vault.items():
                 context_parts.append(f"- {name}: {formula}")
+
+
+        # v13.0: Spatial Grounding context
+        if getattr(self, 'visual_memory', None):
+            spatial_ctx = self.visual_memory.build_spatial_context(user_message)
+            if spatial_ctx:
+                context_parts.append(f"\n{spatial_ctx}")
 
         context_block = "\n".join(context_parts)
         system = (
