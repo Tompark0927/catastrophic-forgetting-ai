@@ -42,6 +42,13 @@ import time
 from typing import Optional
 from fza_event_bus import bus
 
+# v12.0: Constitutional gating
+try:
+    from fza_superego import get_superego
+    _SUPEREGO_AVAILABLE = True
+except ImportError:
+    _SUPEREGO_AVAILABLE = False
+
 
 # Parsing patterns for self-directive tokens
 _PATTERNS = {
@@ -67,6 +74,8 @@ class MetaCognitionEngine:
         self.manager = manager
         self.directive_log: list[dict] = []
         self.total_directives = 0
+        # v12.0: attach the Superego gatekeeper
+        self.superego = get_superego(strict=True) if _SUPEREGO_AVAILABLE else None
     
     def process(self, raw_output: str) -> tuple[str, list[dict]]:
         """
@@ -82,29 +91,53 @@ class MetaCognitionEngine:
         # ── PRUNE ──────────────────────────────────────────────────────────────
         for m in _PATTERNS["prune"].finditer(raw_output):
             adapter_id = m.group(1).strip()
+            directive = {"type": "prune", "target": adapter_id}
+            if self.superego:
+                decision = self.superego.vet_directive(directive)
+                if not decision.approved:
+                    executed.append({**directive, "result": f"vetoed:{decision.verdict.reason}"})
+                    continue
             result = self._exec_prune(adapter_id)
-            executed.append({"type": "prune", "target": adapter_id, "result": result})
+            executed.append({**directive, "result": result})
         clean = _PATTERNS["prune"].sub("", clean)
         
         # ── STRENGTHEN ─────────────────────────────────────────────────────────
         for m in _PATTERNS["strengthen"].finditer(raw_output):
             topic = m.group(1).strip()
+            directive = {"type": "strengthen", "topic": topic}
+            if self.superego:
+                decision = self.superego.vet_directive(directive)
+                if not decision.approved:
+                    executed.append({**directive, "result": f"vetoed:{decision.verdict.reason}"})
+                    continue
             result = self._exec_strengthen(topic)
-            executed.append({"type": "strengthen", "topic": topic, "result": result})
+            executed.append({**directive, "result": result})
         clean = _PATTERNS["strengthen"].sub("", clean)
         
         # ── TRUST ──────────────────────────────────────────────────────────────
         for m in _PATTERNS["trust"].finditer(raw_output):
             statement = m.group(1).strip()
+            directive = {"type": "trust", "statement": statement}
+            if self.superego:
+                decision = self.superego.vet_directive(directive)
+                if not decision.approved:
+                    executed.append({**directive, "result": f"vetoed:{decision.verdict.reason}"})
+                    continue
             result = self._exec_trust(statement)
-            executed.append({"type": "trust", "statement": statement, "result": result})
+            executed.append({**directive, "result": result})
         clean = _PATTERNS["trust"].sub("", clean)
         
         # ── DOUBT ──────────────────────────────────────────────────────────────
         for m in _PATTERNS["doubt"].finditer(raw_output):
             statement = m.group(1).strip()
+            directive = {"type": "doubt", "statement": statement}
+            if self.superego:
+                decision = self.superego.vet_directive(directive)
+                if not decision.approved:
+                    executed.append({**directive, "result": f"vetoed:{decision.verdict.reason}"})
+                    continue
             result = self._exec_doubt(statement)
-            executed.append({"type": "doubt", "statement": statement, "result": result})
+            executed.append({**directive, "result": result})
         clean = _PATTERNS["doubt"].sub("", clean)
         
         # ── REFLECT ────────────────────────────────────────────────────────────

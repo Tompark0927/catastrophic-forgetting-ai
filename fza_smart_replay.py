@@ -223,6 +223,17 @@ class FZASmartReplay:
                     
             # Return the original fact + at most 3 variations
             spindles = [fact] + variations[:3]
+            
+            # v12.0: Aligned Sleep Spindles — filter through Superego
+            try:
+                from fza_superego import get_superego
+                sg = get_superego(strict=False)  # non-strict: allow warnings through
+                spindles = sg.filter_memories(spindles)
+                if not spindles:
+                    spindles = [fact]  # always keep the original fact
+            except Exception:
+                pass  # Superego unavailable — proceed without filtering
+            
             return spindles
         except Exception as e:
             print(f"⚠️ [SmartReplay] 수면 방추 생성 실패: {e}")
