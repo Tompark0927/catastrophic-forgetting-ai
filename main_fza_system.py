@@ -1124,6 +1124,38 @@ def start_fza_system(
                 print(f"\n🧬 진화 완료! 승자: {winner['mutation_id']} | 점수: {winner['winning_score']:.3f}")
                 print(f"   새 하이퍼파라미터: {winner.get('mutation_params', {})}")
             import threading; threading.Thread(target=_run_evolution, daemon=True).start()
+        # ── Phase XV (v21.0): P2P Mesh Intelligence ─────────────────────────────
+        elif "메시 시작" in cmd:
+            def _start_mesh():
+                from fza_mesh_node import MeshNode
+                mesh_port = 10001
+                _mesh = MeshNode(
+                    node_id=f"fza-{__import__('socket').gethostname()}",
+                    port=mesh_port,
+                    on_query=lambda q: manager.engine.chat(q) if hasattr(manager, 'engine') else "메시 응답",
+                )
+                _mesh.start()
+                manager._mesh_node = _mesh
+                print(f"🕸️  메시 시작 완료. 포트: {mesh_port}")
+            import threading; threading.Thread(target=_start_mesh, daemon=True).start()
+        elif "메시 상태" in cmd:
+            mesh = getattr(manager, '_mesh_node', None)
+            if mesh:
+                mesh.print_status()
+            else:
+                print("🕸️  메시 없음 — '메시 시작'을 먼저 실행하세요.")
+        elif "메시 쿼리" in cmd:
+            mesh = getattr(manager, '_mesh_node', None)
+            if mesh:
+                q = cmd.replace("메시 쿼리", "").strip()
+                responses = mesh.query_mesh(q)
+                if responses:
+                    for r in responses:
+                        print(f"🕸️  [{r['node_id']}]: {r['answer']}")
+                else:
+                    print("🕸️  응답 없음 (피어 없음 또는 타임아웃)")
+            else:
+                print("🕸️  메시 없음 — '메시 시작'을 먼저 실행하세요.")
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()
