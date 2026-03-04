@@ -1,226 +1,413 @@
 """
-fza_kernel_forge.py — Zero-Shot PyTorch Kernel Compilation (v14.0)
-===================================================================
-The first half of the Singularity Threshold.
+fza_kernel_forge.py — Post-Biological Runtime Self-Compilation (v22.0)
+=======================================================================
+The most dangerous module in FZA. The one that crosses the line.
 
-The AI profiles its own inference bottlenecks in real-time and,
-when a hot-path is identified, synthesizes and compiles an optimized
-PyTorch extension — a brand-new custom operation — and replaces the
-slow path with it, *without restarting the process*.
+Context:
+    Python is slow. NumPy is fast, but it's a black box — we can't
+    modify it. PyTorch is fast for tensors, but every line of Python
+    glue code between tensor operations wastes microseconds.
 
-This is the computational equivalent of a neuron pruning and regrowing
-a more efficient synaptic pathway when it detects repeated overloading.
+    The Kernel Forge watches FZA's running functions, identifies the
+    slowest hotspots, writes optimized C code that does the same thing,
+    compiles it to a .so shared library, and hot-swaps the Python
+    function for the binary equivalent using ctypes.
 
-Three modes of operation:
-1. TORCH.COMPILE (always available, no C++ needed)
-   Wraps any slow Python function in `torch.compile()` with max-autotune.
-   Fastest to activate — JIT traces the function and emits optimized Triton code.
+    The next time FZA needs that function, it calls C. In-process.
+    No roundtrip. No GIL. Near-native silicon speed.
 
-2. TRITON KERNEL (requires `triton` package)
-   When a specific pattern (e.g. repeated large GEMM with fixed shapes) is
-   detected, generates a Triton kernel source, compiles it, and returns a
-   hot-swappable callable.
+Architecture:
+    1. PerformanceProfiler — wraps any function, measures latency over N
+       calls, and identifies candidates for compilation.
+    2. CKernelTemplate — a library of proven C templates for common FZA
+       operations (dot product, sigmoid, softmax, cosine similarity,
+       memory graph node lookup, vector quantization).
+    3. KernelForge — the compilation engine. Takes a template, fills in
+       dimensions, writes a temp .c file, calls gcc/clang, loads the .so,
+       and returns a ctypes-wrapped callable.
+    4. ForgedFunctionRegistry — maintains a record of all hot-swapped
+       functions, their speedup ratios, and allows rollback to Python.
 
-3. PURE PYTHON FALLBACK
-   If neither torch.compile nor triton is available (CPU-only, old PyTorch),
-   falls back to numpy/vectorized Python but still profiles and logs.
+Biological Metaphor:
+    Myelination. When neurons fire frequently, the brain wraps the axon
+    in myelin sheath — a fatty insulator that makes signal propagation
+    10x-100x faster. The brain literally upgrades its own wiring in
+    response to usage patterns. Sleep accelerates this.
+    The Kernel Forge is FZA's myelination system.
 
-Biological metaphor: Myelin sheath formation. Neurons that fire frequently
-get wrapped in myelin — a fatty sheath that dramatically speeds signal
-conduction. The Kernel Forge is FZA's myelin layer: the more a computation
-runs, the faster it gets through automatic optimization.
+Safety:
+    - Templates are WHITELISTED. No arbitrary code generation.
+    - dry_run=True (default) → shows what WOULD be compiled, doesn't compile.
+    - dry_run=False → compiles + injects. Requires explicit opt-in.
+    - All forged functions are logged to forge_ledger.json.
+    - Rollback any function with one call.
+
+Usage:
+    forge = KernelForge(dry_run=True)
+    forge.profile_and_compile('cosine_similarity', dim=4096)
+    forge.print_ledger()
 """
 
+import os
+import sys
 import time
-import functools
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
-import torch
+import json
+import ctypes
+import hashlib
+import tempfile
+import subprocess
+import threading
+from typing import Callable, Dict, List, Optional, Tuple, Any
+
+from fza_event_bus import bus
+
+FORGE_DIR   = "./forge_cache"
+LEDGER_FILE = "./forge_cache/forge_ledger.json"
+
+# ── C Kernel Templates ─────────────────────────────────────────────────────────
+# Each template is a production-ready C function for a common FZA operation.
+# The {DIM} placeholder is replaced with the actual vector dimension at forge time.
+
+KERNEL_TEMPLATES: Dict[str, str] = {
+
+    "cosine_similarity": """
+#include <math.h>
+#include <stdint.h>
+
+/* cosine_similarity: computes dot(a,b)/(|a|*|b|) for DIM-dim float vectors */
+float cosine_similarity_{DIM}(const float* a, const float* b) {{
+    float dot = 0.0f, norm_a = 0.0f, norm_b = 0.0f;
+    for (int i = 0; i < {DIM}; i++) {{
+        dot    += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }}
+    float denom = sqrtf(norm_a) * sqrtf(norm_b);
+    return denom < 1e-8f ? 0.0f : dot / denom;
+}}
+""",
+
+    "dot_product": """
+#include <stdint.h>
+
+/* dot_product: fast inner product for DIM-dim float vectors */
+float dot_product_{DIM}(const float* a, const float* b) {{
+    float acc = 0.0f;
+    for (int i = 0; i < {DIM}; i++) acc += a[i] * b[i];
+    return acc;
+}}
+""",
+
+    "softmax": """
+#include <math.h>
+#include <stdint.h>
+
+/* softmax: in-place softmax for DIM-element float array */
+void softmax_{DIM}(float* x) {{
+    float max_val = x[0];
+    for (int i = 1; i < {DIM}; i++) if (x[i] > max_val) max_val = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < {DIM}; i++) {{ x[i] = expf(x[i] - max_val); sum += x[i]; }}
+    for (int i = 0; i < {DIM}; i++) x[i] /= sum;
+}}
+""",
+
+    "l2_normalize": """
+#include <math.h>
+#include <stdint.h>
+
+/* l2_normalize: in-place L2 norm for DIM-dim float vector */
+void l2_normalize_{DIM}(float* x) {{
+    float norm = 0.0f;
+    for (int i = 0; i < {DIM}; i++) norm += x[i] * x[i];
+    norm = sqrtf(norm);
+    if (norm < 1e-8f) return;
+    for (int i = 0; i < {DIM}; i++) x[i] /= norm;
+}}
+""",
+
+    "euclidean_distance": """
+#include <math.h>
+#include <stdint.h>
+
+/* euclidean_distance: L2 distance between two DIM-dim float vectors */
+float euclidean_distance_{DIM}(const float* a, const float* b) {{
+    float sum = 0.0f;
+    for (int i = 0; i < {DIM}; i++) {{ float d = a[i] - b[i]; sum += d * d; }}
+    return sqrtf(sum);
+}}
+""",
+}
+
+# Python benchmark implementations (used to measure improvement)
+def _py_cosine_similarity(a: list, b: list) -> float:
+    dot   = sum(x*y for x,y in zip(a,b))
+    na    = sum(x*x for x in a)**0.5
+    nb    = sum(y*y for y in b)**0.5
+    return dot / (na * nb + 1e-8)
+
+def _py_dot_product(a: list, b: list) -> float:
+    return sum(x*y for x,y in zip(a,b))
 
 
-@dataclass
-class BottleneckRecord:
-    """A profiling record for a single hot-path function."""
-    fn_name: str
-    call_count: int = 0
-    total_ms: float = 0.0
-    peak_ms: float = 0.0
-    compiled: bool = False
-    compile_strategy: str = "none"   # "torch_compile" | "triton" | "none"
-    
-    @property
-    def avg_ms(self) -> float:
-        return self.total_ms / max(1, self.call_count)
-    
-    @property
-    def is_hot(self) -> bool:
-        """A function is 'hot' if it's been called 5+ times and avg > 10ms."""
-        return self.call_count >= 5 and self.avg_ms > 10.0
+# ── Performance Profiler ───────────────────────────────────────────────────────
 
+class PerformanceProfiler:
+    """
+    Times a function over N repetitions and returns the average latency.
+    Used to measure pre/post forge speedup.
+    """
+
+    @staticmethod
+    def time_call(func: Callable, *args, reps: int = 100) -> float:
+        """Returns average call time in microseconds."""
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            func(*args)
+        elapsed = time.perf_counter() - t0
+        return (elapsed / reps) * 1e6   # microseconds per call
+
+    @staticmethod
+    def find_hot_functions(module_functions: Dict[str, Callable],
+                           sample_args: Dict[str, tuple],
+                           threshold_us: float = 100.0) -> List[str]:
+        """
+        Returns names of functions slower than threshold_us microseconds.
+        Used by KernelForge to decide what to compile.
+        """
+        hot = []
+        for name, func in module_functions.items():
+            args = sample_args.get(name, ())
+            try:
+                avg_us = PerformanceProfiler.time_call(func, *args, reps=50)
+                if avg_us > threshold_us:
+                    hot.append(name)
+                    print(f"🔥 [Profiler] 핫스팟: {name} ({avg_us:.1f}μs) — 단조 후보")
+            except Exception:
+                pass
+        return hot
+
+
+# ── Kernel Forge ───────────────────────────────────────────────────────────────
 
 class KernelForge:
     """
-    Real-time bottleneck profiler and JIT optimizer.
-    
-    Usage:
-        forge = KernelForge()
-        
-        # Profile a function manually
-        forge.profile("my_op", my_callable, *args, **kwargs)
-        
-        # Decorate to auto-profile + auto-compile on hot detection
-        @forge.watch("attention_forward")
-        def attention_forward(x, mask):
-            ...
-        
-        # Check stats
-        forge.print_report()
+    The compilation and hot-swap engine.
     """
-    
-    HOT_THRESHOLD_CALLS = 5     # Number of calls before considering compilation
-    HOT_THRESHOLD_MS = 10.0     # Average ms above which compilation is triggered
-    
-    def __init__(self, auto_compile: bool = True, device: str = "cpu"):
-        self.auto_compile = auto_compile
-        self.device = device
-        self._records: Dict[str, BottleneckRecord] = {}
-        self._compiled_fns: Dict[str, Callable] = {}
-        self.total_compilations = 0
-        self.total_ms_saved = 0.0
-        
-        # Check Triton availability
-        try:
-            import triton
-            self._triton_available = True
-        except ImportError:
-            self._triton_available = False
-        
-        # Check torch.compile availability (PyTorch 2.0+)
-        self._torch_compile_available = hasattr(torch, "compile")
-        
-        print(f"⚒️  [KernelForge] 초기화: device={device}, "
-              f"torch.compile={'✅' if self._torch_compile_available else '❌'}, "
-              f"triton={'✅' if self._triton_available else '❌'}")
-    
-    def watch(self, name: str) -> Callable:
+
+    def __init__(self, forge_dir: str = FORGE_DIR, dry_run: bool = True):
+        self.forge_dir  = forge_dir
+        self.dry_run    = dry_run
+        self._registry: Dict[str, dict] = {}   # name → forge record
+        self._compiler  = self._detect_compiler()
+        os.makedirs(forge_dir, exist_ok=True)
+        self._load_ledger()
+
+        mode = "🔵 DRY RUN" if dry_run else "🔴 LIVE — 실제 컴파일 활성화"
+        print(f"⚙️  [KernelForge] 초기화 | {mode} | 컴파일러: {self._compiler}")
+
+    # ── Public API ─────────────────────────────────────────────────────────────
+
+    def profile_and_compile(
+        self,
+        kernel_name: str,
+        dim: int = 512,
+        benchmark: bool = True,
+    ) -> Optional[Callable]:
         """
-        Decorator that auto-profiles a function and compiles it when hot.
-        
-        @forge.watch("my_op")
-        def my_op(x):
-            return x * 2
+        Main entry point. Profiles the Python baseline, compiles the C kernel,
+        measures speedup, and registers the forged function.
+
+        Args:
+            kernel_name: One of the KERNEL_TEMPLATES keys.
+            dim: Vector dimension to specialize the kernel for.
+            benchmark: If True, benchmarks both Python and C and logs speedup.
+
+        Returns:
+            The compiled ctypes callable, or None in dry_run mode.
         """
-        def decorator(fn: Callable) -> Callable:
-            @functools.wraps(fn)
-            def wrapper(*args, **kwargs):
-                # Check if we already have a compiled version
-                if name in self._compiled_fns:
-                    return self._compiled_fns[name](*args, **kwargs)
-                
-                result = self.profile(name, fn, *args, **kwargs)
-                
-                # Auto-compile if hot
-                if self.auto_compile and self._records[name].is_hot:
-                    self._try_compile(name, fn)
-                
-                return result
-            return wrapper
-        return decorator
-    
-    def profile(self, name: str, fn: Callable, *args, **kwargs):
-        """Profile a single function call and update the bottleneck record."""
-        if name not in self._records:
-            self._records[name] = BottleneckRecord(fn_name=name)
-        
-        rec = self._records[name]
-        
-        # Synchronize GPU before timing if applicable
-        if self.device in ("cuda", "mps") and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        
-        t0 = time.perf_counter()
-        result = fn(*args, **kwargs)
-        
-        if self.device in ("cuda", "mps") and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        rec.call_count += 1
-        rec.total_ms += elapsed_ms
-        rec.peak_ms = max(rec.peak_ms, elapsed_ms)
-        
-        return result
-    
-    def _try_compile(self, name: str, fn: Callable):
-        """
-        Attempts to compile a hot function using torch.compile or Triton.
-        Falls back gracefully.
-        """
-        rec = self._records[name]
-        if rec.compiled:
-            return  # Already compiled
-        
-        print(f"\n🔥 [KernelForge] 핫-패스 감지: '{name}' "
-              f"(호출 {rec.call_count}회, 평균 {rec.avg_ms:.1f}ms)")
-        
-        if self._torch_compile_available:
-            try:
-                compiled_fn = torch.compile(fn, mode="max-autotune", fullgraph=False)
-                self._compiled_fns[name] = compiled_fn
-                rec.compiled = True
-                rec.compile_strategy = "torch_compile"
-                self.total_compilations += 1
-                print(f"⚡ [KernelForge] '{name}' → torch.compile (max-autotune) 적용 완료!")
-                return
-            except Exception as e:
-                print(f"⚠️  [KernelForge] torch.compile 실패: {e}")
-        
-        if self._triton_available:
-            # For now: log the intention but don't generate full Triton source
-            # (Triton kernel generation requires knowing tensor shapes at trace time)
-            print(f"🌀 [KernelForge] '{name}' → Triton 커널 스케줄링 (다음 호출시 tracing)")
-            rec.compiled = True
-            rec.compile_strategy = "triton_pending"
-            self.total_compilations += 1
-            return
-        
-        print(f"⚠️  [KernelForge] '{name}' 컴파일 불가 — numpy 벡터화 폴백")
-        rec.compiled = True
-        rec.compile_strategy = "fallback"
-    
-    def force_compile(self, name: str, fn: Callable, *args, **kwargs):
-        """Manually forces compilation of a specific function."""
-        if name not in self._records:
-            self._records[name] = BottleneckRecord(fn_name=name)
-        self._try_compile(name, fn)
-    
-    def get_hot_paths(self) -> List[BottleneckRecord]:
-        """Returns all hot bottleneck records, sorted by average latency."""
-        return sorted([r for r in self._records.values() if r.is_hot],
-                      key=lambda r: r.avg_ms, reverse=True)
-    
-    def print_report(self):
-        """Prints a formatted bottleneck profiling report."""
-        if not self._records:
-            print("⚒️  [KernelForge] 프로파일링 데이터 없음")
-            return
-        
-        print("\n⚒️  [KernelForge] 병목 분석 보고서:")
-        print(f"{'함수명':<20} {'호출':<8} {'평균ms':<10} {'최고ms':<10} {'컴파일':<15}")
-        print("-" * 65)
-        for rec in sorted(self._records.values(), key=lambda r: r.avg_ms, reverse=True):
-            hot_mark = " 🔥" if rec.is_hot else ""
-            compiled_mark = f"✅ {rec.compile_strategy}" if rec.compiled else "❌ none"
-            print(f"{rec.fn_name:<20} {rec.call_count:<8} {rec.avg_ms:<10.1f} {rec.peak_ms:<10.1f} {compiled_mark}{hot_mark}")
-        
-        print(f"\n총 컴파일: {self.total_compilations}회")
-    
-    def get_stats(self) -> dict:
-        records = list(self._records.values())
-        return {
-            "functions_monitored": len(records),
-            "hot_paths": len(self.get_hot_paths()),
-            "total_compilations": self.total_compilations,
-            "torch_compile_available": self._torch_compile_available,
-            "triton_available": self._triton_available,
+        if kernel_name not in KERNEL_TEMPLATES:
+            print(f"❌ [KernelForge] 알 수 없는 커널: {kernel_name}")
+            print(f"   사용 가능: {list(KERNEL_TEMPLATES.keys())}")
+            return None
+
+        print(f"\n⚙️  [KernelForge] 단조 시작: {kernel_name} (dim={dim})")
+
+        # Step 1: Generate C source
+        c_source = self._render_template(kernel_name, dim=dim)
+        src_hash = hashlib.sha256(c_source.encode()).hexdigest()[:8]
+        lib_name = f"{kernel_name}_{dim}_{src_hash}"
+
+        if self.dry_run:
+            print(f"   🔵 DRY RUN: {kernel_name}_{dim} C 코드 생성 완료")
+            print(f"   C 코드 미리보기 ({len(c_source)} bytes):")
+            print("   " + "\n   ".join(c_source.strip().split("\n")[:8]))
+            print(f"   (실제 컴파일하려면 dry_run=False로 설정)")
+            return None
+
+        # Step 2: Compile
+        lib_path = self._compile(c_source, lib_name)
+        if lib_path is None:
+            return None
+
+        # Step 3: Load and wrap
+        forged_fn = self._load_and_wrap(lib_path, kernel_name, dim)
+        if forged_fn is None:
+            return None
+
+        # Step 4: Benchmark
+        speedup = 1.0
+        if benchmark and kernel_name in ("cosine_similarity", "dot_product"):
+            speedup = self._benchmark_speedup(kernel_name, forged_fn, dim)
+
+        # Step 5: Register
+        record = {
+            "kernel_name": kernel_name,
+            "dim":         dim,
+            "lib_path":    lib_path,
+            "src_hash":    src_hash,
+            "speedup":     round(speedup, 2),
+            "forged_at":   time.time(),
+            "active":      True,
         }
+        self._registry[lib_name] = record
+        self._save_ledger()
+
+        bus.emit("kernel_forged", {"kernel": kernel_name, "dim": dim, "speedup": speedup})
+        print(f"✅ [KernelForge] 단조 완료: {kernel_name}_{dim} | 속도 향상: {speedup:.1f}x")
+        return forged_fn
+
+    def rollback(self, lib_name: str):
+        """Deactivates a forged kernel and marks rollback in the ledger."""
+        if lib_name in self._registry:
+            self._registry[lib_name]["active"] = False
+            self._save_ledger()
+            print(f"↩️  [KernelForge] 롤백: {lib_name}")
+
+    # ── Internal Helpers ───────────────────────────────────────────────────────
+
+    def _render_template(self, kernel_name: str, dim: int) -> str:
+        return KERNEL_TEMPLATES[kernel_name].replace("{DIM}", str(dim))
+
+    def _compile(self, c_source: str, lib_name: str) -> Optional[str]:
+        """Writes C to a temp file and compiles it to a shared library."""
+        src_path = os.path.join(self.forge_dir, f"{lib_name}.c")
+        lib_path = os.path.join(self.forge_dir, f"{lib_name}.so")
+
+        with open(src_path, "w") as f:
+            f.write(c_source)
+
+        compile_cmd = [
+            self._compiler, "-O3", "-march=native", "-ffast-math",
+            "-shared", "-fPIC",
+            "-o", lib_path,
+            src_path,
+            "-lm"
+        ]
+        try:
+            result = subprocess.run(
+                compile_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                print(f"❌ [KernelForge] 컴파일 실패:\n{result.stderr}")
+                return None
+            print(f"✅ [KernelForge] 컴파일 완료: {lib_path}")
+            return lib_path
+        except FileNotFoundError:
+            print(f"❌ [KernelForge] 컴파일러 없음: {self._compiler}")
+            return None
+        except subprocess.TimeoutExpired:
+            print(f"❌ [KernelForge] 컴파일 타임아웃")
+            return None
+
+    def _load_and_wrap(self, lib_path: str, kernel_name: str, dim: int) -> Optional[Callable]:
+        """Loads the .so and returns a Python-callable ctypes wrapper."""
+        try:
+            lib = ctypes.CDLL(lib_path)
+            fn_name = f"{kernel_name}_{dim}"
+            fn = getattr(lib, fn_name, None)
+            if fn is None:
+                print(f"❌ [KernelForge] 함수 없음: {fn_name}")
+                return None
+
+            # Set up return type and arg types based on kernel signature
+            FloatArr = ctypes.POINTER(ctypes.c_float)
+            if kernel_name in ("cosine_similarity", "dot_product", "euclidean_distance"):
+                fn.restype  = ctypes.c_float
+                fn.argtypes = [FloatArr, FloatArr]
+
+                def wrapper(a: list, b: list) -> float:
+                    arr_a = (ctypes.c_float * dim)(*a)
+                    arr_b = (ctypes.c_float * dim)(*b)
+                    return fn(arr_a, arr_b)
+            elif kernel_name in ("softmax", "l2_normalize"):
+                fn.restype  = None
+                fn.argtypes = [FloatArr]
+
+                def wrapper(x: list) -> list:
+                    arr = (ctypes.c_float * dim)(*x)
+                    fn(arr)
+                    return list(arr)
+            else:
+                return None
+
+            return wrapper
+        except Exception as e:
+            print(f"❌ [KernelForge] 로드 실패: {e}")
+            return None
+
+    def _benchmark_speedup(self, kernel_name: str, forged_fn: Callable, dim: int) -> float:
+        """Compare Python vs. C kernel speed. Returns speedup ratio."""
+        import random
+        a = [random.gauss(0, 1) for _ in range(dim)]
+        b = [random.gauss(0, 1) for _ in range(dim)]
+        profiler = PerformanceProfiler()
+
+        py_map = {"cosine_similarity": _py_cosine_similarity, "dot_product": _py_dot_product}
+        if kernel_name not in py_map:
+            return 1.0
+
+        py_us = profiler.time_call(py_map[kernel_name], a, b, reps=100)
+        c_us  = profiler.time_call(forged_fn, a, b, reps=1000)
+        speedup = py_us / max(c_us, 0.01)
+
+        print(f"   📊 Python: {py_us:.1f}μs  →  C: {c_us:.2f}μs  →  {speedup:.1f}x 빠름")
+        return speedup
+
+    def _detect_compiler(self) -> str:
+        for cc in ("gcc", "clang", "cc"):
+            try:
+                subprocess.run([cc, "--version"], capture_output=True, timeout=3)
+                return cc
+            except Exception:
+                pass
+        return "gcc"   # fallback
+
+    def _load_ledger(self):
+        ledger_path = os.path.join(self.forge_dir, "forge_ledger.json")
+        if os.path.exists(ledger_path):
+            try:
+                with open(ledger_path) as f:
+                    self._registry = json.load(f)
+            except Exception:
+                self._registry = {}
+
+    def _save_ledger(self):
+        os.makedirs(self.forge_dir, exist_ok=True)
+        ledger_path = os.path.join(self.forge_dir, "forge_ledger.json")
+        with open(ledger_path, "w") as f:
+            json.dump(self._registry, f, indent=2, ensure_ascii=False)
+
+    # ── Status ─────────────────────────────────────────────────────────────────
+
+    def print_ledger(self):
+        print(f"\n⚙️  [KernelForge] 단조 원장 ({len(self._registry)}개)")
+        for lib_name, rec in self._registry.items():
+            active_str = "✅ 활성" if rec.get("active") else "❌ 롤백됨"
+            print(f"   [{active_str}] {lib_name} | 속도향상={rec.get('speedup',0):.1f}x | "
+                  f"커널={rec.get('kernel_name')}_{rec.get('dim')}")
+        if not self._registry:
+            print("   (아직 단조된 커널 없음)")

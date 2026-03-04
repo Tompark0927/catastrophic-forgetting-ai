@@ -1156,6 +1156,29 @@ def start_fza_system(
                     print("🕸️  응답 없음 (피어 없음 또는 타임아웃)")
             else:
                 print("🕸️  메시 없음 — '메시 시작'을 먼저 실행하세요.")
+        # ── Phase XVI (v22.0): Post-Biological Kernel Forge ─────────────────────
+        elif "단조 목록" in cmd:
+            from fza_kernel_forge import KernelForge
+            KernelForge(dry_run=True).print_ledger()
+        elif "단조" in cmd:
+            # Usage: 단조 cosine_similarity 4096
+            parts = cmd.split()
+            kernel = "cosine_similarity"
+            dim = 4096
+            for p in parts:
+                if p.isdigit():
+                    dim = int(p)
+                elif p in ("cosine_similarity", "dot_product", "softmax", "l2_normalize", "euclidean_distance"):
+                    kernel = p
+            def _forge():
+                live = "--live" in cmd.lower()
+                from fza_kernel_forge import KernelForge
+                f = KernelForge(dry_run=not live)
+                fn = f.profile_and_compile(kernel, dim=dim, benchmark=True)
+                if fn:
+                    print(f"⚙️  '{kernel}_{dim}' 단조 완료! 함수 핫스왑 가능")
+                f.print_ledger()
+            import threading; threading.Thread(target=_forge, daemon=True).start()
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()
