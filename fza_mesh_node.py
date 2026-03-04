@@ -1,7 +1,41 @@
 """
-fza_mesh_node.py — Decentralized P2P Mesh Intelligence (v21.0)
+fza_mesh_node.py — Decentralized P2P Mesh Intelligence (v23.0)
 ===============================================================
-The Substrate. The Nervous System of the Swarm.
+Dual-backend architecture:
+  - FAST PATH: Tries to import `fza_mesh_rs` (native Rust/PyO3 libp2p module).
+    If installed (via `./fza_build_rust.sh`), uses the Rust backend:
+      * Lock-free, multi-threaded parallel peer queries
+      * Kademlia DHT routing (NAT-traversing, internet-scale)
+      * Full concurrent TCP streams without touching the Python GIL
+  - FALLBACK: If Rust module not found, uses the pure-Python backend
+    (same API, socket-based, local-network only).
+
+Run `./fza_build_rust.sh` to enable the Rust backend.
+"""
+
+import os
+import json
+import time
+import socket
+import threading
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Callable
+from fza_event_bus import bus
+
+# ── Backend Selection ─────────────────────────────────────────────────────────
+
+try:
+    from fza_mesh_rs import FzaMeshNodeRs as _RustNode
+    _RUST_BACKEND = True
+    print("🦀 [MeshNode] Rust libp2p 백엔드 활성화 (v23.0)")
+except ImportError:
+    _RustNode = None
+    _RUST_BACKEND = False
+    print("🐍 [MeshNode] Python 백엔드 활성화 (Rust 미설치 — ./fza_build_rust.sh 실행)")
+
+
+
 
 Current state (v16.0 Swarm): FZA nodes talk through a centralized Broker.
 If the Broker dies, the Swarm dies. This is a single point of failure — the

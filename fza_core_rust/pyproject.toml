@@ -1,0 +1,21 @@
+"""
+pyproject.toml — Maturin build config for fza_core_rust (v23.0)
+Used by `maturin develop` (debug) or `maturin build --release` (prod).
+"""
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fza_mesh_rs"
+version = "0.1.0"
+description = "FZA Phase XVII — Native Rust libp2p mesh node with PyO3 bindings"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "fza_mesh_rs"
