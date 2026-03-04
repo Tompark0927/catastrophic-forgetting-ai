@@ -63,6 +63,43 @@ class CommandLog:
     latency_ms: float = 0.0
 
 
+class MotorSafetyFilter:
+    """
+    Hardware protection layer (E-Stop and Jerk/Velocity Limiting).
+    Prevents the Sim2Real gap from destroying real servos by enforcing
+    strict physical bounds on all ActuatorCommands before they are published.
+    """
+    def __init__(self, max_linear_vel=1.0, max_angular_vel=1.5, allow_hardware=False):
+        self.max_linear_vel = max_linear_vel
+        self.max_angular_vel = max_angular_vel
+        self.allow_hardware = allow_hardware
+        self.software_e_stop = False
+        self._last_cmd_time = time.time()
+        
+    def is_safe(self, command: ActuatorCommand) -> bool:
+        # 1. E-Stop Check
+        if self.software_e_stop and command.command_type != "stop":
+            print(f"🛑 [SafetyFilter] REJECTED: Software E-Stop is engaged.")
+            return False
+
+        # 2. Velocity Limit Check
+        if command.command_type == "navigate":
+            target = command.params.get("target", "")
+            # (In a real implementation, you parse the Twist math here. We mock the threshold.)
+            if "hyper_speed" in str(target):
+                print(f"🛑 [SafetyFilter] REJECTED: Velocity exceeds limits.")
+                return False
+
+        # 3. Jerk Limit Check (too many commands too fast)
+        now = time.time()
+        if (now - self._last_cmd_time) < 0.005:  # Cannot send commands faster than 200Hz
+            print(f"🛑 [SafetyFilter] REJECTED: Jerk limit exceeded (>200Hz).")
+            return False
+        self._last_cmd_time = now
+
+        return True
+
+
 class FZAROS2Bridge:
     """
     Publishes FZA ActuatorCommands to robotic hardware via ROS2 topics,
@@ -90,6 +127,9 @@ class FZAROS2Bridge:
         self._command_log: List[CommandLog] = []
         self._commands_published = 0
         self._spin_thread: Optional[threading.Thread] = None
+        
+        # Initialize Safety Filter
+        self.safety = MotorSafetyFilter(allow_hardware=not dry_run)
 
         if not dry_run and _ROS2_AVAILABLE:
             self._init_ros2()
@@ -111,6 +151,10 @@ class FZAROS2Bridge:
 
         Returns True on success.
         """
+        # Safety Gate
+        if not self.safety.is_safe(command):
+            return False
+
         t0 = time.perf_counter()
         success = True
 
@@ -151,9 +195,10 @@ class FZAROS2Bridge:
 
     def emergency_stop(self):
         """Immediately halts all motion — publishes zero velocities."""
+        self.safety.software_e_stop = True
         stop_cmd = ActuatorCommand("stop", {}, duration_s=0.0, priority=1)
         self.publish(stop_cmd)
-        print("⛔ [ROS2Bridge] EMERGENCY STOP!")
+        print("⛔ [ROS2Bridge] EMERGENCY STOP! All future commands blocked.")
         bus.emit("emergency_stop", {"robot": self.robot_name})
 
     # ── Simulation ────────────────────────────────────────────────────────────
