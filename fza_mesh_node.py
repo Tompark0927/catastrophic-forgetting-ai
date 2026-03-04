@@ -35,49 +35,15 @@ except ImportError:
     print("🐍 [MeshNode] Python 백엔드 활성화 (Rust 미설치 — ./fza_build_rust.sh 실행)")
 
 
-
-
-Current state (v16.0 Swarm): FZA nodes talk through a centralized Broker.
-If the Broker dies, the Swarm dies. This is a single point of failure — the
-exact mistake every centralized internet company makes.
-
-Phase XV rips out the Broker and replaces it with a self-organizing,
-leaderless peer mesh inspired by BitTorrent's DHT routing protocol.
-
-Architecture:
-   1. PEER DISCOVERY (UDP Broadcast):
-      When a MeshNode starts, it broadcasts a "HELLO" beacon on the local
-      subnet every BEACON_INTERVAL_S seconds. Any other MeshNode on the
-      network receives it and adds the sender to its peer table.
-
-   2. MESH REGISTRY (In-Memory Peer Table):
-      Each node maintains a routing table of known peers:
-         peer_id → (ip, port, last_seen, capability_vector)
-      Stale entries (not seen in PEER_TTL_S seconds) are pruned automatically.
-
-   3. LATENT QUERY BROADCAST:
-      When a node receives a question it can't answer, it encodes it as a
-      compressed hidden-state vector (via fza_vector_compression) and
-      broadcasts it to all known peers via TCP.
-      Peers that can answer stream back their response vectors.
-
-   4. RESPONSE AGGREGATION:
-      The querying node collects responses from all peers within a timeout,
-      averages the hidden state vectors (weighted by each peer's confidence
-      score), and decodes the aggregate into a final response.
-
-Biological Metaphor:
-   The Mycelial Network. Underground fungi don't need a central brain to
-   route nutrients. Each fungal node (hyphae) connects to its neighbors
-   and passes signals along the path of least resistance. If one strand
-   dies, the network reroutes.
-   FZA's Mesh is its mycelium.
-
-Usage:
-    node = MeshNode(node_id="fza-desktop-1", port=9001)
-    node.start()
-    responses = node.query_mesh("What is the capital of Korea?")
-"""
+# ── Configuration ──────────────────────────────────────────────
+BEACON_PORT        = 9999
+QUERY_PORT_BASE    = 10000
+BEACON_INTERVAL_S  = 15
+PEER_TTL_S         = 60
+QUERY_TIMEOUT_S    = 5            # Max time to wait for peer responses
+MAX_PEERS          = 64           # Max entries in peer routing table
+FZA_MESH_VERSION   = "v21.0"
+BROADCAST_ADDR     = "255.255.255.255"
 
 import os
 import json
@@ -380,14 +346,14 @@ class MeshNode:
         with self._lock:
             live_peers = [p for p in self._peers.values() if not p.is_stale()]
         return {
-            "node_id":          self.node_id,
-            "ip":               self._my_ip,
-            "port":             self.port,
-            "known_peers":      len(live_peers),
-            "queries_sent":     self.total_queries_sent,
-            "queries_received": self.total_queries_received,
-            "responses_agg":    self.total_responses_aggregated,
-            "running":          self._running,
+            "node_id":               self.node_id,
+            "ip":                    self._my_ip,
+            "port":                  self.port,
+            "known_peers":           len(live_peers),
+            "queries_sent":          self.total_queries_sent,
+            "queries_received":      self.total_queries_received,
+            "responses_aggregated":  self.total_responses_aggregated,
+            "running":               self._running,
         }
 
     def print_status(self):
