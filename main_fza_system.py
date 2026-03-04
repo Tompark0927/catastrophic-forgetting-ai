@@ -1102,6 +1102,28 @@ def start_fza_system(
             from fza_ros2_bridge import FZAROS2Bridge, _ROS2_AVAILABLE
             bridge_stat = FZAROS2Bridge(robot_name="fza_bot", dry_run=True)
             bridge_stat.print_status()
+        # ── Phase XIV (v20.0): Synthetic Natural Selection ──────────────────────
+        elif "진화" in cmd and "계보" in cmd:
+            # '진화 계보' — show evolutionary lineage
+            from fza_evolution_arena import EvolutionArena
+            _arena = EvolutionArena(dry_run=True)
+            _arena.print_lineage()
+        elif "진화" in cmd:
+            # '진화' — trigger one evolutionary cycle
+            def _run_evolution():
+                pop = 5
+                dry = "--live" not in cmd.lower()
+                from fza_evolution_arena import EvolutionArena
+                _arena = EvolutionArena(
+                    seed_path="./jellyfish_seed/core_seed.json",
+                    workspace_dir=".",
+                    population=pop,
+                    dry_run=dry,
+                )
+                winner = _arena.run()
+                print(f"\n🧬 진화 완료! 승자: {winner['mutation_id']} | 점수: {winner['winning_score']:.3f}")
+                print(f"   새 하이퍼파라미터: {winner.get('mutation_params', {})}")
+            import threading; threading.Thread(target=_run_evolution, daemon=True).start()
         elif "반사 통계" in cmd or "reflex" in cmd.lower():
             if manager.reflex:
                 manager.reflex.print_stats()
